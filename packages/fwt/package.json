@@ -17,7 +17,7 @@
     "dist"
   ],
   "scripts": {
-    "build": "pkgroll --clean-dist"
+    "build": "tsdown src/bin.ts --minify"
   },
   "devDependencies": {
     "@moeru/cliff": "catalog:inlined",

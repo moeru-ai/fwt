@@ -25,8 +25,8 @@
     "eslint": "catalog:dev",
     "eslint-plugin-oxlint": "catalog:dev",
     "oxlint": "catalog:dev",
-    "pkgroll": "catalog:dev",
     "skills-npm": "catalog:dev",
+    "tsdown": "catalog:dev",
     "turbo": "catalog:dev",
     "typescript": "catalog:dev",
     "vitest": "catalog:dev"
