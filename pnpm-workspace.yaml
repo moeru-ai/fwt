@@ -27,6 +27,7 @@ catalogs:
     '@moeru/eslint-config': ^0.1.0-beta.20
     '@moeru/tsconfig': ^0.1.0-beta.20
     '@types/node': ^26.6.4
+    bumpp: ^12.3.0
     cspell: ^10.4.0
     eslint: ^10.12.0
     eslint-plugin-oxlint: ^1.87.0
