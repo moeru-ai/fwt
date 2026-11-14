@@ -4,24 +4,40 @@ ignorePaths:
   - skills-lock.json
   - skills-npm-lock.json
   - node_modules/**
-  - dist/**
+  - '**/dist/**'
   - coverage/**
   - .turbo/**
 words:
   - actioned
+  - apos
   - behaviour
+  - commandcode
+  - deepseek
+  - devstral
   - esbuild
   - evals
+  - headlessly
+  - heredocs
   - Kimi
   - kwaa
+  - masknet
   - mattpocock
   - moeru
   - multimodal
   - NAPI
+  - ollama
+  - opencode
+  - openrouter
+  - picklist
   - pkgroll
+  - qwen
   - Pocock
   - Runta
+  - smol
+  - unstub
+  - valibot
   - vercel
+  - vitest
   - wayfinder
   - Wayfinding
   - xsai

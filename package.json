@@ -11,20 +11,22 @@
     "lint": "moeru-lint .",
     "prepare": "skills-npm --agents claude-code,codex",
     "spellcheck": "cspell lint . --no-progress",
+    "test": "vitest run",
     "typecheck": "tsc -b tsconfig.lib.json tsconfig.node.json"
   },
   "devDependencies": {
-    "@kwaa/skills": "catalog:",
-    "@moeru/eslint-config": "catalog:",
-    "@moeru/tsconfig": "catalog:",
-    "@types/node": "catalog:",
-    "cspell": "catalog:",
-    "eslint": "catalog:",
-    "eslint-plugin-oxlint": "catalog:",
-    "oxlint": "catalog:",
-    "pkgroll": "catalog:",
-    "skills-npm": "catalog:",
-    "turbo": "catalog:",
-    "typescript": "catalog:"
+    "@kwaa/skills": "catalog:dev",
+    "@moeru/eslint-config": "catalog:dev",
+    "@moeru/tsconfig": "catalog:dev",
+    "@types/node": "catalog:dev",
+    "cspell": "catalog:dev",
+    "eslint": "catalog:dev",
+    "eslint-plugin-oxlint": "catalog:dev",
+    "oxlint": "catalog:dev",
+    "pkgroll": "catalog:dev",
+    "skills-npm": "catalog:dev",
+    "turbo": "catalog:dev",
+    "typescript": "catalog:dev",
+    "vitest": "catalog:dev"
   }
 }

@@ -10,21 +10,25 @@
     "directory": "packages/fwt"
   },
   "bugs": "https://github.com/moeru-ai/fwt/issues",
-  "sideEffects": false,
-  "exports": "./src/index.ts",
-  "files": ["dist"],
-  "publishConfig": {
-    "exports": {
-      ".": {
-        "types": "./dist/index.d.ts",
-        "default": "./dist/index.js"
-      },
-      "./package.json": "./package.json"
-    },
-    "main": "./dist/index.js",
-    "types": "./dist/index.d.ts"
+  "bin": {
+    "fwt": "./dist/bin.js"
   },
+  "files": [
+    "dist"
+  ],
   "scripts": {
     "build": "pkgroll --clean-dist"
+  },
+  "devDependencies": {
+    "@moeru/cliff": "catalog:inlined",
+    "@moeru/std": "catalog:inlined",
+    "@valibot/to-json-schema": "catalog:inlined",
+    "@xsai/text": "catalog:inlined",
+    "@xsai/text-chat": "catalog:inlined",
+    "@xsai/text-messages": "catalog:inlined",
+    "@xsai/text-responses": "catalog:inlined",
+    "smol-toml": "catalog:inlined",
+    "valibot": "catalog:inlined",
+    "xdg-basedir": "catalog:inlined"
   }
 }

@@ -1,0 +1,285 @@
+# fwt
+
+`fwt` is a headless coding agent. You give it a task as a prompt. It runs shell commands in a working directory until the task is done, and then it prints the answer.
+
+fwt runs in one of three modes. All of them use the same agent, providers, and sessions:
+
+| Mode | Command | Output | Use it when |
+| --- | --- | --- | --- |
+| Text | `fwt -p "<prompt>"` | The final answer on standard output | A person or a script needs only the answer. |
+| JSON Lines | `fwt -p "<prompt>" -o jsonl` | One JSON object for each event, and a `result` line | A program follows the run or needs the session ID. |
+| ACP | `fwt acp` | JSON-RPC over standard input and standard output | An editor or an orchestrator controls the agent. |
+
+fwt connects to a model through a provider. A provider is an API service that hosts models, for example DeepSeek or OpenCode Go. Before your first task, you add a provider.
+
+## Install fwt
+
+```sh
+npm install -g @moeru-ai/fwt
+```
+
+You can also run it without an install, with `npx @moeru-ai/fwt` in place of `fwt`.
+
+## Add a provider
+
+fwt can fill in a provider from [models.dev](https://models.dev), a public list of providers and models. Use the provider ID from models.dev, for example `deepseek` or `opencode-go`.
+
+1. Start the setup:
+
+	```sh
+	fwt provider add deepseek
+	```
+
+2. When fwt asks for the API key, type it. fwt does not show the key on the screen. It saves the key in `auth.json`.
+3. When fwt shows the list of models, type the number or the ID of the model that you want.
+4. When fwt asks if the provider becomes the default, type `y` or `n`. fwt uses the default provider when you do not give `--provider`.
+
+fwt writes the provider and the model to `config.toml`. The [files](#files) section gives the location of each file.
+
+If the provider is not on models.dev, give its base URL and its wire protocol. fwt then gets the list of models from the `/models` endpoint of that URL:
+
+```sh
+fwt provider add my-gateway --base-url https://gateway.example.com/v1 --protocol chat
+```
+
+To add a provider from a script, give every answer as a flag. fwt then asks no questions:
+
+```sh
+fwt provider add deepseek --api-key "$DEEPSEEK_API_KEY" -m deepseek-v4-flash --default yes
+```
+
+To see the providers that you added, run `fwt provider list`. To remove a provider and its saved key, run `fwt provider remove <id>`.
+
+## Run a task
+
+Give the prompt with `-p`:
+
+```sh
+fwt -p "Fix the failing test in src/parse.test.ts"
+```
+
+You can also give the prompt as the first argument, or on standard input:
+
+```sh
+git diff | fwt "Review this diff"
+```
+
+fwt works in the current directory. To use a different directory, add `--cwd <path>`.
+
+In the default text output, fwt writes the answer to standard output as the model writes it. To read each step from a program, add `-o jsonl`. fwt then writes one JSON object per line for each event. The last line has the type `result` and these fields:
+
+- `sessionId`: the ID of the session.
+- `stopReason`: the reason why the run stopped.
+- `steps`: the number of model steps.
+- `text`: the final answer.
+- `cacheStats`: statistics about the prompt cache.
+
+The exit code tells you why the run stopped:
+
+| Exit code | `stopReason` | Meaning |
+| --- | --- | --- |
+| 0 | `completed` | The model gave its final answer. |
+| 3 | `context_limit` | The conversation filled the context window. |
+| 4 | `loop_detected` | The model made the same tool calls three times in a row. |
+| 5 | `max_turns` | The run reached the limit that you set with `--max-turns`. |
+| 130 | `aborted` | The run was stopped, for example with Ctrl+C. |
+
+## Continue a session
+
+fwt saves each run as a session. To give more instructions in the same conversation, use `--resume` with the session ID:
+
+```sh
+fwt --resume 0f9c2a1e-5b7d-4c3a-9e21-6d8f4a0b1c2d -p "Also add a test for empty input"
+```
+
+The `sessionId` field of the `result` line gives the ID. `--resume latest` continues the most recent session. You can also give the path of the session file.
+
+A resumed session uses the provider and the model that it used before. If you give `--provider`, `--base-url`, or `--model`, fwt uses the new value.
+
+## Use a model without a provider
+
+To use an API endpoint that you did not add, give `--base-url`. fwt then uses no `config.toml` entry and no saved key:
+
+```sh
+fwt -p "Explain src/index.ts" \
+	--base-url https://api.example.com/v1 \
+	--protocol responses \
+	--model example-coder \
+	--api-key "$EXAMPLE_API_KEY"
+```
+
+fwt does not know the context window of such a model. It uses 250,000 tokens. If the model has a different window, give `--context-length`.
+
+To resume a session that used `--base-url` without a provider, give `--base-url` and `--model` again.
+
+Some providers need extra HTTP headers. Give each one with `--header`. fwt replaces `{session}` with the session ID:
+
+```sh
+fwt -p "…" --header "x-trace-id: {session}" --header "x-team: tools"
+```
+
+## Run fwt as an ACP server
+
+`fwt acp` serves the Agent Client Protocol (ACP) over standard input and standard output. An ACP client, for example an editor, starts the process and sends JSON-RPC requests. fwt supports ACP versions 1 and 2, and these methods:
+
+- `initialize`
+- `session/new`, `session/load`, and `session/resume`
+- `session/prompt` and `session/cancel`
+- `session/set_mode`
+
+A session has one of two modes. In `auto` mode, which is the default, fwt runs each tool call. In `ask` mode, fwt sends `session/request_permission` to the client before each tool call. To start in `ask` mode, add `--permission-mode ask`.
+
+The model flags, for example `--provider` and `--model`, apply to each new session.
+
+## Reference
+
+### Flags
+
+These flags apply to `fwt` and to `fwt acp`:
+
+| Flag | Value |
+| --- | --- |
+| `--cwd <path>` | The working directory. The default is the current directory. |
+| `-m, --model <model>` | The model ID. |
+| `--provider <provider>` | A provider ID from `config.toml`. |
+| `--protocol <chat\|responses\|messages>` | The wire protocol. |
+| `--base-url <url>` | The API base URL. |
+| `--api-key <key>` | The API key. |
+| `--effort <effort>` | The reasoning effort. fwt sends the value without a change, for example `low`, `high`, or `max`. |
+| `--context-length <tokens>` | The context window in tokens. |
+| `--header <header...>` | An extra HTTP header as `"name: value"`. You can give it more than once. |
+| `--permission-mode <auto\|ask>` | The ACP permission mode. `ask` works only with `fwt acp`. |
+| `--max-turns <count>` | The maximum number of model steps for one prompt. The default is no limit. |
+
+These flags apply only to `fwt`:
+
+| Flag | Value |
+| --- | --- |
+| `-p, --prompt <text>` | The prompt. |
+| `-r, --resume <session>` | A session ID, a session file path, or `latest`. |
+| `-o, --output <text\|jsonl>` | The output format. The default is `text`. |
+| `--acp` | The same as `fwt acp`. |
+
+### Wire protocols
+
+| Protocol | API |
+| --- | --- |
+| `chat` | OpenAI Chat Completions |
+| `responses` | OpenAI Responses |
+| `messages` | Anthropic Messages |
+
+A provider can have one base URL for each protocol. fwt uses the first protocol from this list that applies:
+
+1. The `--protocol` flag or `FWT_PROTOCOL`.
+2. The `protocol` of the model in `config.toml`.
+3. The first protocol that models.dev gives for the model, if the provider has a base URL for it.
+4. The first base URL of the provider.
+
+### Environment variables
+
+| Variable | Same as |
+| --- | --- |
+| `FWT_HOME` | Puts all fwt files in this one directory. See [files](#files). |
+| `FWT_PROVIDER` | `--provider` |
+| `FWT_MODEL` | `--model` |
+| `FWT_PROTOCOL` | `--protocol` |
+| `FWT_BASE_URL` | `--base-url` |
+| `FWT_API_KEY` | `--api-key` |
+| `FWT_EFFORT` | `--effort` |
+| `FWT_CONTEXT_LENGTH` | `--context-length` |
+
+A flag has priority over its variable. A variable has priority over `config.toml`.
+
+fwt looks for the API key in this order: `--api-key`, `FWT_API_KEY`, the variable that `env_key` names in `config.toml`, and then `auth.json`.
+
+### Files
+
+fwt puts its files in the XDG base directories on Linux and on macOS:
+
+| File | Location |
+| --- | --- |
+| Configuration | `$XDG_CONFIG_HOME/fwt/config.toml` (default `~/.config/fwt/config.toml`) |
+| API keys | `$XDG_DATA_HOME/fwt/auth.json` (default `~/.local/share/fwt/auth.json`) |
+| Sessions | `$XDG_STATE_HOME/fwt/sessions/` (default `~/.local/state/fwt/sessions/`) |
+| models.dev cache | `$XDG_CACHE_HOME/fwt/models.dev.json` (default `~/.cache/fwt/models.dev.json`) |
+
+If `FWT_HOME` is set, all four go in that directory. fwt writes `config.toml` and `auth.json` with mode `0600`.
+
+`fwt provider add` downloads the models.dev list and keeps it in the cache. A task run reads only the cache. It does not connect to models.dev.
+
+### config.toml
+
+`fwt provider add` writes this file. You can also edit it yourself:
+
+```toml
+provider = "gateway"
+
+[providers.gateway]
+name = "My gateway"
+model = "coder"
+env_key = "GATEWAY_API_KEY"
+base_url = { chat = "https://gateway.example.com/v1", messages = "https://gateway.example.com/anthropic/v1" }
+headers = { x-session-id = "{session}" }
+
+[providers.gateway.models.coder]
+context = 131072
+max_output = 8192
+protocol = "chat"
+effort = "high"
+image = false
+```
+
+| Key | Meaning |
+| --- | --- |
+| `provider` | The default provider. |
+| `providers.<id>.base_url` | One base URL for each protocol. You must give at least one. |
+| `providers.<id>.model` | The model that fwt uses when you do not give `--model`. |
+| `providers.<id>.env_key` | The environment variable that holds the API key. |
+| `providers.<id>.headers` | Extra HTTP headers. fwt replaces `{session}` with the session ID. |
+| `providers.<id>.name` | A display name. |
+| `providers.<id>.models.<model>` | Values for one model. These values have priority over models.dev. |
+
+For the `opencode` and `opencode-go` providers, `fwt provider add` sets the `x-opencode-session` header to `{session}`.
+
+### Context window and output limit
+
+fwt takes the context window from `--context-length`, from `FWT_CONTEXT_LENGTH`, from `config.toml`, or from models.dev, in that order. If none of them gives a value, the window is 250,000 tokens.
+
+The output limit for one step is the lowest of three values: the `max_output` of the model, 32,768 tokens, and a quarter of the context window. fwt sends the output limit to the API only with the `messages` protocol, because the Anthropic Messages API requires it.
+
+fwt keeps the output limit free in the context window. When the input of a step reaches 85% of the rest, fwt tells the model to finish its work. When the input reaches the rest, the run stops with exit code 3.
+
+### Retries
+
+If a request to the model fails before the response starts, fwt sends it again up to four times. fwt does this for network errors, for status 429, and for status 500 and higher. It waits 200 ms before the first new attempt, and it doubles the wait each time. If the response has a `Retry-After` header, fwt waits that long, up to 60 seconds.
+
+If the response stops after it started, fwt does not send the request again. The run fails. You can continue it with `--resume`.
+
+### Tools
+
+The model has these tools:
+
+| Tool | Use |
+| --- | --- |
+| `exec_command` | Runs a shell command with `bash -c`. If the input has `stdin`, fwt writes it to the command and then closes standard input. |
+| `write_stdin` | Writes to a command that is still running, or gets its new output. |
+| `view_image` | Reads a PNG, JPEG, GIF, or WebP file. fwt gives this tool only to a model that accepts images. |
+
+`exec_command` returns after the command ends, or after `yield_time_ms` (default 10 seconds). If the command is still running, it keeps running, and the model can use `write_stdin` with the session ID. Commands do not get a terminal (TTY). Up to 64 commands can run at the same time. When the run ends or stops, fwt stops all of its commands.
+
+fwt has no tool that edits files. The model edits files with shell commands, for example a Python script on `stdin`.
+
+### Skills
+
+A skill is a directory with a `SKILL.md` file. The file gives the model instructions for one kind of task. fwt reads skills from two directories:
+
+- `~/.agents/skills/`
+- `.agents/skills/` in the working directory
+
+If a skill with the same name is in both directories, fwt uses the one in the working directory. fwt gives the model the name and the description of each skill. The model reads the full `SKILL.md` when a task matches the description.
+
+To use a skill in a prompt, write its name after `/` at the start of the prompt, or after `$` anywhere in the prompt. fwt then adds the full `SKILL.md` to the prompt:
+
+```sh
+fwt -p '/code-review Review the changes since main'
+```
