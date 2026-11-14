@@ -1,0 +1,21 @@
+version: "0.2"
+ignorePaths:
+  - pnpm-lock.yaml
+  - skills-lock.json
+  - skills-npm-lock.json
+  - node_modules/**
+  - dist/**
+  - coverage/**
+  - .turbo/**
+words:
+  - actioned
+  - behaviour
+  - esbuild
+  - kwaa
+  - mattpocock
+  - moeru
+  - pkgroll
+  - Pocock
+  - wayfinder
+  - Wayfinding
+  - xsmcp

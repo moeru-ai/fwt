@@ -1,0 +1,30 @@
+{
+  "name": "@moeru-ai/fwt-workspace",
+  "type": "module",
+  "version": "0.0.0",
+  "private": true,
+  "packageManager": "pnpm@12.3.4",
+  "repository": "github:moeru-ai/fwt",
+  "scripts": {
+    "build": "turbo build",
+    "dev": "turbo dev",
+    "lint": "moeru-lint .",
+    "prepare": "skills-npm --agents claude-code,codex",
+    "spellcheck": "cspell lint . --no-progress",
+    "typecheck": "tsc -b tsconfig.lib.json tsconfig.node.json"
+  },
+  "devDependencies": {
+    "@kwaa/skills": "catalog:",
+    "@moeru/eslint-config": "catalog:",
+    "@moeru/tsconfig": "catalog:",
+    "@types/node": "catalog:",
+    "cspell": "catalog:",
+    "eslint": "catalog:",
+    "eslint-plugin-oxlint": "catalog:",
+    "oxlint": "catalog:",
+    "pkgroll": "catalog:",
+    "skills-npm": "catalog:",
+    "turbo": "catalog:",
+    "typescript": "catalog:"
+  }
+}
