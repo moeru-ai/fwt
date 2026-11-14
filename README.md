@@ -47,7 +47,7 @@ Then ask your coding agent to give a task to fwt.
 
 ## Acknowledgements
 
-fwt takes ideas from [Codex](https://github.com/openai/codex) and [Pi](https://github.com/earendil-works/pi). From Codex, it takes the `exec_command` and `write_stdin` tools, the provider configuration in TOML, and the retry rules for model requests. From Pi, it takes the idea of a small agent that leaves out features that the user can add elsewhere.
+fwt takes ideas from [Codex](https://github.com/openai/codex) and [Pi](https://github.com/earendil-works/pi). From Codex, it takes the `exec_command` and `write_stdin` tools, the provider configuration in TOML, and the retry rules for model requests. From Pi, fwt draws inspiration from the idea of keeping an agent harness small and focused.
 
 ## License
 
