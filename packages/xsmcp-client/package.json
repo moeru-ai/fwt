@@ -27,8 +27,5 @@
   },
   "scripts": {
     "build": "tsdown src/index.ts --dts --minify --tsconfig ../../tsconfig.lib.json"
-  },
-  "tsdown": {
-    "fixedExtension": false
   }
 }
