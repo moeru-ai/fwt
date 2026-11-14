@@ -1,5 +1,7 @@
 # fwt
 
+> Subagent harness, featherweight.
+
 fwt is a headless coding agent that other programs run as a subagent.
 
 You give fwt one task. It works in a directory with shell commands until the task is done, and then it prints the answer. A script, an editor, or another coding agent can start it. Each fwt process runs one agent, and the program that starts it decides what each agent does.
@@ -34,7 +36,7 @@ fwt -p "Fix the failing test in src/parse.test.ts"
 The [fwt skill](skills/fwt/SKILL.md) tells a coding agent how to give a task to fwt and how to read the result. Install it for all of your projects with the [`skills`](https://github.com/vercel-labs/skills) command:
 
 ```sh
-npx skills add moeru-ai/fwt --skill fwt -g
+npx skills add moeru-ai/fwt
 ```
 
 Then ask your coding agent to give a task to fwt.
