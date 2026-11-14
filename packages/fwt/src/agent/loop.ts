@@ -47,6 +47,7 @@ interface RunAgentOptions {
   maxTurns?: number
   model: ResolvedModelConfig
   onEvent?: (event: AgentEvent) => void
+  onPromptInserted?: () => void
   preToolCall?: PreToolCall
   prompt: string
   sessionStore?: SessionStore
@@ -203,6 +204,8 @@ export const runAgent = async (options: RunAgentOptions): Promise<AgentRunResult
 
   if (options.sessionStore != null)
     await options.sessionStore.appendMessage(nextUserMessage)
+
+  options.onPromptInserted?.()
 
   const conversation: Message[] = [...seedMessages, nextUserMessage]
   const providerOptions: LanguageModelProviderOptions | undefined = options.model.protocol === 'messages'

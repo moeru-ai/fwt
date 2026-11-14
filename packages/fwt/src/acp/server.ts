@@ -1,5 +1,6 @@
-import type { PreToolCall, ToolCallPart, ToolResultPart } from '@xsai/text'
+import type { Message, PreToolCall, ToolCallPart, ToolResultPart } from '@xsai/text'
 
+import type { AgentStopReason } from '../agent'
 import type { ModelConfigInput, ResolvedModelConfig } from '../providers'
 import type { SessionStore } from '../session'
 import type { AcpProtocolVersion, AcpServerOptions, PermissionMode, PermissionOutcome } from './types'
@@ -7,6 +8,7 @@ import type { AcpProtocolVersion, AcpServerOptions, PermissionMode, PermissionOu
 import process from 'node:process'
 
 import { randomUUID } from 'node:crypto'
+import { resolve } from 'node:path'
 import { createInterface } from 'node:readline'
 
 import * as v from 'valibot'
@@ -14,7 +16,7 @@ import * as v from 'valibot'
 import { version } from '../../package.json' with { type: 'json' }
 import { runAgent } from '../agent'
 import { resolveModel, resolveRecordedModel } from '../providers'
-import { createSessionStore, openSessionStore } from '../session'
+import { createSessionStore, listSessionHeaders, openSessionStore } from '../session'
 import {
   createAgentEventMapper,
   extractPromptText,
@@ -29,6 +31,8 @@ import {
   RpcError,
   safeJsonParse,
   sessionCancelParamsSchema,
+  sessionCloseParamsSchema,
+  sessionListParamsSchema,
   sessionLoadParamsSchema,
   sessionNewParamsSchema,
   sessionPromptParamsSchema,
@@ -40,7 +44,6 @@ import {
 } from './protocol'
 
 interface AcpRuntime {
-  defaultCwd: string
   defaultPermissionMode: PermissionMode
   maxTurns?: number
   modelConfig?: ModelConfigInput
@@ -71,6 +74,7 @@ interface AcpSessionState {
   permissionMode: PermissionMode
   store: SessionStore
   toolPolicy: Map<string, 'allow' | 'reject'>
+  turn?: Promise<void>
 }
 
 type JsonRpcId = number | string
@@ -154,8 +158,10 @@ const buildPreToolCall = (
       return undefined
     if (outcome === 'reject_always')
       session.toolPolicy.set(call.name, 'reject')
-    if (outcome === 'cancelled')
-      throw new Error('Cancelled')
+    if (outcome === 'cancelled') {
+      session.activeController?.abort(new Error('Permission request cancelled'))
+      signal.throwIfAborted()
+    }
 
     return {
       callId: call.callId,
@@ -168,6 +174,8 @@ const buildPreToolCall = (
 const handleInitialize = (runtime: AcpRuntime, params: unknown): Record<string, unknown> => {
   const parsed = parseParams(initializeParamsSchema, params)
   runtime.protocolVersion = negotiateProtocolVersion(parsed.protocolVersion)
+  if (runtime.protocolVersion === 2 && parsed.info == null)
+    throw new RpcError(-32602, 'Invalid params at info: Expected the client implementation info')
 
   if (runtime.protocolVersion === 1) {
     return {
@@ -193,11 +201,10 @@ const handleInitialize = (runtime: AcpRuntime, params: unknown): Record<string, 
 const handleSessionNew = async (runtime: AcpRuntime, params: unknown): Promise<Record<string, unknown>> => {
   const parsed = parseParams(sessionNewParamsSchema, params)
   const model = resolveModel(runtime.modelConfig)
-  const cwd = parsed.cwd != null && parsed.cwd !== '' ? parsed.cwd : runtime.defaultCwd
   const mode = runtime.defaultPermissionMode
 
   const store = await createSessionStore({
-    cwd,
+    cwd: parsed.cwd,
     model: model.model,
     protocol: model.protocol,
     provider: model.provider,
@@ -236,50 +243,105 @@ const ensureSession = async (runtime: AcpRuntime, sessionId: string): Promise<Ac
   return session
 }
 
+const assertSessionCwd = (session: AcpSessionState, cwd: string): void => {
+  if (resolve(cwd) !== resolve(session.store.header.cwd))
+    throw new RpcError(-32602, `cwd does not match the session working directory: ${session.store.header.cwd}`)
+}
+
+type SendUpdate = (update: Record<string, unknown>) => void
+
+const replayMessageV1 = (message: Message, send: SendUpdate): void => {
+  if (message.role !== 'assistant' || typeof message.content === 'string')
+    return
+  for (const part of message.content) {
+    if (part.type === 'text')
+      send({ content: { text: part.text, type: 'text' }, sessionUpdate: 'agent_message_chunk' })
+  }
+}
+
+const replayMessageV2 = (message: Message, messageId: string, send: SendUpdate): void => {
+  const parts = typeof message.content === 'string' ? [{ text: message.content, type: 'text' as const }] : message.content
+  const content = parts.filter(part => part.type === 'text').map(part => ({ text: part.text, type: 'text' }))
+  if (content.length > 0 && message.role === 'user')
+    send({ content, messageId, sessionUpdate: 'user_message' })
+  if (content.length > 0 && message.role === 'assistant')
+    send({ content, messageId, sessionUpdate: 'agent_message' })
+
+  for (const part of parts) {
+    if (part.type === 'tool-call') {
+      send({
+        kind: toolKind(part.name),
+        name: part.name,
+        rawInput: safeJsonParse(part.arguments),
+        sessionUpdate: 'tool_call_update',
+        status: 'in_progress',
+        title: part.name,
+        toolCallId: part.callId,
+      })
+    }
+    else if (part.type === 'tool-result') {
+      send({
+        rawOutput: part.output,
+        sessionUpdate: 'tool_call_update',
+        status: part.isError === true ? 'failed' : 'completed',
+        toolCallId: part.callId,
+      })
+    }
+  }
+}
+
 const replayHistory = (runtime: AcpRuntime, store: SessionStore): void => {
-  const send = (update: Record<string, unknown>): void => {
+  const send: SendUpdate = (update) => {
     const note = sessionUpdate(store.id, update)
     runtime.sendNotification(note.method, note.params)
   }
-  const v1 = runtime.protocolVersion === 1
-
-  for (const message of store.messages()) {
-    if (message.role === 'user' && typeof message.content === 'string' && !v1) {
-      send({ content: [{ text: message.content, type: 'text' }], messageId: randomUUID(), sessionUpdate: 'user_message' })
-    }
-    else if (message.role === 'assistant' && typeof message.content !== 'string') {
-      for (const part of message.content.filter(part => part.type === 'text')) {
-        send(v1
-          ? { content: { text: part.text, type: 'text' }, sessionUpdate: 'agent_message_chunk' }
-          : { content: [{ text: part.text, type: 'text' }], messageId: randomUUID(), sessionUpdate: 'agent_message' })
-      }
-    }
+  for (const [index, message] of store.messages().entries()) {
+    if (runtime.protocolVersion === 1)
+      replayMessageV1(message, send)
+    else
+      replayMessageV2(message, `${store.id}:${index}`, send)
   }
 }
 
 const handleSessionLoad = async (runtime: AcpRuntime, params: unknown): Promise<Record<string, unknown>> => {
   const parsed = parseParams(sessionLoadParamsSchema, params)
   const session = await ensureSession(runtime, parsed.sessionId)
+  assertSessionCwd(session, parsed.cwd)
   replayHistory(runtime, session.store)
   return { modes: formatModes(session.permissionMode), sessionId: session.store.id }
 }
 
 const handleSessionResume = async (runtime: AcpRuntime, params: unknown): Promise<Record<string, unknown>> => {
-  if (runtime.protocolVersion === 1) {
-    const parsed = parseParams(sessionLoadParamsSchema, params)
-    const session = await ensureSession(runtime, parsed.sessionId)
-    return { modes: formatModes(session.permissionMode), sessionId: session.store.id }
-  }
-
-  const parsed = parseParams(sessionResumeParamsSchema, params)
+  const parsed = parseParams(runtime.protocolVersion === 1 ? sessionLoadParamsSchema : sessionResumeParamsSchema, params)
+  if ('replayFrom' in parsed && parsed.replayFrom != null && parsed.replayFrom.type !== 'start')
+    throw new RpcError(-32602, `Unsupported replay cursor: ${parsed.replayFrom.type}`)
   const session = await ensureSession(runtime, parsed.sessionId)
-  if (parsed.replayFrom?.type === 'start') {
+  assertSessionCwd(session, parsed.cwd)
+
+  if (runtime.protocolVersion === 1)
+    return { modes: formatModes(session.permissionMode), sessionId: session.store.id }
+
+  if ('replayFrom' in parsed && parsed.replayFrom != null) {
     replayHistory(runtime, session.store)
     const note = sessionUpdate(session.store.id, { sessionUpdate: 'replay_complete' })
     runtime.sendNotification(note.method, note.params)
   }
   runtime.sendSessionState(session.store.id, session.activeController == null ? 'idle' : 'running')
   return { configOptions: [formatModeConfigOption(session.permissionMode)] }
+}
+
+const handleSessionList = async (runtime: AcpRuntime, params: unknown): Promise<Record<string, unknown>> => {
+  const parsed = parseParams(sessionListParamsSchema, params)
+  const entries = await listSessionHeaders(runtime.sessionsDir)
+  return {
+    sessions: entries
+      .filter(({ header }) => parsed.cwd == null || resolve(header.cwd) === resolve(parsed.cwd))
+      .map(({ header, updatedAt }) => ({
+        cwd: header.cwd,
+        sessionId: header.id,
+        updatedAt: updatedAt.toISOString(),
+      })),
+  }
 }
 
 const findSession = (runtime: AcpRuntime, sessionId: string): AcpSessionState => {
@@ -305,16 +367,61 @@ const handleSessionSetConfigOption = (runtime: AcpRuntime, params: unknown): Rec
   return { configOptions: [formatModeConfigOption(parsed.value)] }
 }
 
-const cancelSession = (runtime: AcpRuntime, params: unknown): void => {
-  const parsed = parseParams(sessionCancelParamsSchema, params)
-  const session = runtime.sessions.get(parsed.sessionId)
-  session?.activeController?.abort(new Error('Session cancelled'))
+const cancelSession = (runtime: AcpRuntime, sessionId: string): void => {
+  runtime.sessions.get(sessionId)?.activeController?.abort(new Error('Session cancelled'))
   for (const [reqId, pending] of runtime.pendingClientRequests.entries()) {
-    if (pending.sessionId === parsed.sessionId) {
+    if (pending.sessionId === sessionId) {
       runtime.pendingClientRequests.delete(reqId)
       pending.resolve({ outcome: { outcome: 'cancelled' } })
     }
   }
+}
+
+const handleSessionClose = async (runtime: AcpRuntime, params: unknown): Promise<Record<string, unknown>> => {
+  const parsed = parseParams(sessionCloseParamsSchema, params)
+  const session = runtime.sessions.get(parsed.sessionId)
+  if (session == null)
+    return {}
+  cancelSession(runtime, parsed.sessionId)
+  await session.turn
+  runtime.sessions.delete(parsed.sessionId)
+  return {}
+}
+
+const startPromptV2 = async (
+  runtime: AcpRuntime,
+  session: AcpSessionState,
+  prompt: unknown,
+  run: (onPromptInserted: () => void) => Promise<{ stopReason: AgentStopReason }>,
+  signal: AbortSignal,
+): Promise<Record<string, unknown>> => {
+  const messageId = randomUUID()
+  const sessionId = session.store.id
+  let inserted = false
+  return new Promise((resolveInserted, rejectInserted) => {
+    session.turn = run(() => {
+      inserted = true
+      const echo = sessionUpdate(sessionId, { content: prompt, messageId, sessionUpdate: 'user_message' })
+      runtime.sendNotification(echo.method, echo.params)
+      runtime.sendSessionState(sessionId, 'running')
+      resolveInserted({ messageId })
+    })
+      .then(result => runtime.sendSessionState(sessionId, 'idle', mapStopReason(result.stopReason)))
+      .catch((error: unknown) => {
+        if (!inserted) {
+          rejectInserted(signal.aborted ? new RpcError(-32800, 'Request cancelled') : error)
+          return
+        }
+        if (signal.aborted) {
+          runtime.sendSessionState(sessionId, 'idle', 'cancelled')
+          return
+        }
+        runtime.sendSessionState(sessionId, 'idle', 'error', {
+          code: -32603,
+          message: error instanceof Error ? error.message : 'Internal error',
+        })
+      })
+  })
 }
 
 const handleSessionPrompt = async (runtime: AcpRuntime, params: unknown): Promise<Record<string, unknown>> => {
@@ -331,7 +438,7 @@ const handleSessionPrompt = async (runtime: AcpRuntime, params: unknown): Promis
   session.activeController = controller
 
   const mapEvent = createAgentEventMapper(runtime.protocolVersion, session.store.id)
-  const run = async (): Promise<Awaited<ReturnType<typeof runAgent>>> => {
+  const run = async (onPromptInserted?: () => void): Promise<Awaited<ReturnType<typeof runAgent>>> => {
     try {
       return await runAgent({
         cwd: session.store.header.cwd,
@@ -342,6 +449,7 @@ const handleSessionPrompt = async (runtime: AcpRuntime, params: unknown): Promis
           if (note != null)
             runtime.sendNotification(note.method, note.params)
         },
+        onPromptInserted,
         preToolCall: buildPreToolCall(runtime, session, linkedSignal),
         prompt: promptText,
         sessionStore: session.store,
@@ -354,29 +462,8 @@ const handleSessionPrompt = async (runtime: AcpRuntime, params: unknown): Promis
     }
   }
 
-  if (runtime.protocolVersion === 2) {
-    const messageId = randomUUID()
-    const echo = sessionUpdate(session.store.id, {
-      content: parsed.prompt,
-      messageId,
-      sessionUpdate: 'user_message',
-    })
-    runtime.sendNotification(echo.method, echo.params)
-    runtime.sendSessionState(session.store.id, 'running')
-    void run()
-      .then(result => runtime.sendSessionState(session.store.id, 'idle', mapStopReason(result.stopReason)))
-      .catch((error: unknown) => {
-        if (linkedSignal.aborted) {
-          runtime.sendSessionState(session.store.id, 'idle', 'cancelled')
-          return
-        }
-        runtime.sendSessionState(session.store.id, 'idle', 'error', {
-          code: -32603,
-          message: error instanceof Error ? error.message : 'Internal error',
-        })
-      })
-    return { messageId }
-  }
+  if (runtime.protocolVersion === 2)
+    return startPromptV2(runtime, session, parsed.prompt, run, linkedSignal)
 
   try {
     const result = await run()
@@ -400,7 +487,7 @@ const handleSessionPrompt = async (runtime: AcpRuntime, params: unknown): Promis
 }
 
 const v1Only = new Set(['session/load', 'session/set_mode'])
-const v2Only = new Set(['session/set_config_option'])
+const v2Only = new Set(['session/close', 'session/list', 'session/set_config_option'])
 
 const dispatchMethod = async (runtime: AcpRuntime, method: string, params: unknown): Promise<unknown> => {
   if (method !== 'initialize' && (runtime.protocolVersion === 1 ? v2Only : v1Only).has(method))
@@ -410,8 +497,12 @@ const dispatchMethod = async (runtime: AcpRuntime, method: string, params: unkno
     case 'initialize':
       return handleInitialize(runtime, params)
     case 'session/cancel':
-      cancelSession(runtime, params)
+      cancelSession(runtime, parseParams(sessionCancelParamsSchema, params).sessionId)
       return {}
+    case 'session/close':
+      return handleSessionClose(runtime, params)
+    case 'session/list':
+      return handleSessionList(runtime, params)
     case 'session/load':
       return handleSessionLoad(runtime, params)
     case 'session/new':
@@ -474,7 +565,7 @@ const handleIncomingLine = (runtime: AcpRuntime, line: string): void => {
 
   if (msg.id == null) {
     if (msg.method === 'session/cancel')
-      cancelSession(runtime, msg.params)
+      cancelSession(runtime, parseParams(sessionCancelParamsSchema, msg.params).sessionId)
     return
   }
 
@@ -501,7 +592,6 @@ export const startAcpServer = async (options: AcpServerOptions): Promise<void> =
   }
 
   const runtime: AcpRuntime = {
-    defaultCwd: options.defaultCwd ?? process.cwd(),
     defaultPermissionMode: options.permissionMode ?? 'auto',
     maxTurns: options.maxTurns,
     modelConfig: options.modelConfig,

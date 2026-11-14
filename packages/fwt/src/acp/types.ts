@@ -3,7 +3,6 @@ import type { ModelConfigInput } from '../providers'
 export type AcpProtocolVersion = 1 | 2
 
 export interface AcpServerOptions {
-  defaultCwd?: string
   input?: NodeJS.ReadableStream
   maxTurns?: number
   modelConfig?: ModelConfigInput

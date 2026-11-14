@@ -2,6 +2,7 @@ import type { AgentEvent, AgentStopReason } from '../agent'
 import type { AcpProtocolVersion, PermissionMode, PermissionOutcome } from './types'
 
 import { randomUUID } from 'node:crypto'
+import { isAbsolute } from 'node:path'
 
 import * as v from 'valibot'
 
@@ -14,21 +15,32 @@ export const jsonRpcEnvelopeSchema = v.looseObject({
   result: v.optional(v.unknown()),
 })
 
+const absolutePathSchema = v.pipe(v.string(), v.check(isAbsolute, 'Expected an absolute path'))
+
 export const initializeParamsSchema = v.object({
-  protocolVersion: v.number(),
+  info: v.optional(v.looseObject({ name: v.string(), version: v.string() })),
+  protocolVersion: v.pipe(v.number(), v.integer(), v.maxValue(65_535)),
 })
 
 export const sessionNewParamsSchema = v.object({
-  cwd: v.optional(v.string()),
+  cwd: absolutePathSchema,
+})
+
+export const sessionListParamsSchema = v.object({
+  cwd: v.optional(v.nullable(absolutePathSchema)),
+})
+
+export const sessionCloseParamsSchema = v.object({
+  sessionId: v.string(),
 })
 
 export const sessionLoadParamsSchema = v.object({
-  cwd: v.optional(v.string()),
+  cwd: absolutePathSchema,
   sessionId: v.string(),
 })
 
 export const sessionResumeParamsSchema = v.object({
-  cwd: v.optional(v.string()),
+  cwd: absolutePathSchema,
   replayFrom: v.optional(v.nullable(v.looseObject({ type: v.string() }))),
   sessionId: v.string(),
 })
@@ -49,13 +61,13 @@ export const sessionCancelParamsSchema = v.object({
   sessionId: v.string(),
 })
 
-const promptBlockSchema = v.looseObject({
-  text: v.optional(v.string()),
-  type: v.string(),
-})
+const promptBlockSchema = v.variant('type', [
+  v.looseObject({ text: v.string(), type: v.literal('text') }),
+  v.looseObject({ name: v.string(), type: v.literal('resource_link'), uri: v.string() }),
+])
 
 export const sessionPromptParamsSchema = v.object({
-  prompt: v.union([v.string(), v.array(promptBlockSchema)]),
+  prompt: v.pipe(v.array(promptBlockSchema), v.minLength(1)),
   sessionId: v.string(),
 })
 
@@ -110,14 +122,8 @@ export const negotiateProtocolVersion = (requested: number): AcpProtocolVersion 
   return requested === 1 ? 1 : 2
 }
 
-export const extractPromptText = (prompt: v.InferOutput<typeof sessionPromptParamsSchema>['prompt']): string => {
-  if (typeof prompt === 'string')
-    return prompt
-  return prompt
-    .filter((block): block is { text: string, type: string } => block.type === 'text' && typeof block.text === 'string')
-    .map(block => block.text)
-    .join('\n')
-}
+export const extractPromptText = (prompt: v.InferOutput<typeof sessionPromptParamsSchema>['prompt']): string =>
+  prompt.map(block => block.type === 'text' ? block.text : `[${block.name}](${block.uri})`).join('\n')
 
 export const parsePermissionOutcome = (value: unknown): PermissionOutcome => {
   const parsed = v.safeParse(permissionResponseSchema, value)
@@ -237,13 +243,12 @@ export const createAgentEventMapper = (
   if (version === 1)
     return event => mapAgentEventV1(sessionId, event)
 
-  const messageId = randomUUID()
-  const thoughtId = randomUUID()
+  let messageId = randomUUID()
+  let thoughtId = randomUUID()
   return (event) => {
     switch (event.type) {
       case 'cache.miss':
       case 'step.end':
-      case 'step.start':
         return undefined
       case 'reasoning.delta':
         return sessionUpdate(sessionId, {
@@ -251,6 +256,10 @@ export const createAgentEventMapper = (
           messageId: thoughtId,
           sessionUpdate: 'agent_thought_chunk',
         })
+      case 'step.start':
+        messageId = randomUUID()
+        thoughtId = randomUUID()
+        return undefined
       case 'text.delta':
         return sessionUpdate(sessionId, {
           content: { text: event.delta, type: 'text' },

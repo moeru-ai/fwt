@@ -4,7 +4,7 @@ import type { WireProtocol } from '../providers'
 
 import { randomUUID } from 'node:crypto'
 import { existsSync } from 'node:fs'
-import { appendFile, mkdir, readdir, readFile, stat } from 'node:fs/promises'
+import { appendFile, mkdir, open, readdir, readFile, stat } from 'node:fs/promises'
 import { dirname, join, resolve } from 'node:path'
 
 import * as v from 'valibot'
@@ -73,6 +73,15 @@ const cacheMissSchema = v.object({
   stepNumber: v.number(),
 })
 
+const safeParseJson = (line: string): unknown => {
+  try {
+    return JSON.parse(line)
+  }
+  catch {
+    return undefined
+  }
+}
+
 const sessionHeaderSchema = v.object({
   createdAt: v.string(),
   cwd: v.string(),
@@ -86,7 +95,7 @@ const sessionHeaderSchema = v.object({
 
 export type CacheMissEvent = v.InferOutput<typeof cacheMissSchema>
 
-type SessionHeader = v.InferOutput<typeof sessionHeaderSchema>
+export type SessionHeader = v.InferOutput<typeof sessionHeaderSchema>
 
 const sessionMessageSchema = v.object({
   message: v.looseObject({
@@ -236,6 +245,26 @@ export const createSessionStore = async (options: CreateSessionStoreOptions): Pr
   await appendFile(filePath, `${JSON.stringify(header)}\n`, 'utf8')
 
   return buildSessionStore(header, filePath, [], createCacheStats())
+}
+
+export const listSessionHeaders = async (sessionsDir: string): Promise<{ header: SessionHeader, updatedAt: Date }[]> => {
+  if (!existsSync(sessionsDir))
+    return []
+  const names = (await readdir(sessionsDir)).filter(name => name.endsWith('.jsonl'))
+  const found = await Promise.all(names.map(async (name) => {
+    const handle = await open(join(sessionsDir, name))
+    try {
+      const first = await handle.readLines()[Symbol.asyncIterator]().next()
+      const parsed = v.safeParse(sessionHeaderSchema, safeParseJson(first.value ?? ''))
+      return parsed.success ? { header: parsed.output, updatedAt: (await handle.stat()).mtime } : undefined
+    }
+    finally {
+      await handle.close()
+    }
+  }))
+  return found
+    .filter(entry => entry != null)
+    .sort((a, b) => b.updatedAt.getTime() - a.updatedAt.getTime())
 }
 
 const findSessionFile = async (idOrPath: string, sessionsDir: string): Promise<string> => {

@@ -172,7 +172,7 @@ describe('fwt CLI', () => {
           else
             rejectAcp(new Error(`ACP exited with code ${code}`))
         })
-        child.stdin.write('{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":2}}\n')
+        child.stdin.write('{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"info":{"name":"test","version":"0"},"protocolVersion":2}}\n')
         child.stdin.end()
       })
 

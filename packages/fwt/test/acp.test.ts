@@ -9,10 +9,10 @@ import { join } from 'node:path'
 import { createInterface } from 'node:readline'
 import { PassThrough } from 'node:stream'
 
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import { startAcpServer } from '../src/acp'
-import { parsePermissionOutcome } from '../src/acp/protocol'
+import { createAgentEventMapper, parsePermissionOutcome } from '../src/acp/protocol'
 
 interface AcpHarness {
   close: () => Promise<void>
@@ -108,7 +108,6 @@ const createAcpHarness = (options: {
   })
 
   const serverDone = startAcpServer({
-    defaultCwd: options.cwd,
     input: clientToServer,
     modelConfig: {
       apiKey: 'test-key',
@@ -327,6 +326,108 @@ describe('aCP v1 and v2 dual-version server', () => {
     const resumeUpdates = acp.notifications.slice(before).map(n => n.params?.update as Record<string, unknown>)
     expect(resumeUpdates.map(u => u.sessionUpdate)).toContain('replay_complete')
     expect(resumeUpdates.at(-1)).toMatchObject({ sessionUpdate: 'state_update', state: 'idle' })
+    expect(resumeUpdates).toContainEqual(expect.objectContaining({ sessionUpdate: 'tool_call_update', status: 'in_progress', toolCallId: 'call_deny' }))
+    expect(resumeUpdates).toContainEqual(expect.objectContaining({ sessionUpdate: 'tool_call_update', status: 'failed', toolCallId: 'call_deny' }))
+
+    await expect(acp.request('session/resume', { cwd: dir, replayFrom: { type: 'later' }, sessionId })).rejects.toThrow('-32602')
+    await expect(acp.request('session/resume', { cwd: join(dir, 'other'), sessionId })).rejects.toThrow('-32602')
+    await expect(acp.request('session/new', { cwd: 'relative' })).rejects.toThrow('-32602')
+    await expect(acp.request('session/prompt', { prompt: [], sessionId })).rejects.toThrow('-32602')
+    await expect(acp.request('session/prompt', { prompt: [{ data: 'x', mimeType: 'image/png', type: 'image' }], sessionId })).rejects.toThrow('-32602')
+
+    const listed = await acp.request('session/list', { cwd: dir })
+    expect(listed.sessions).toMatchObject([{ cwd: dir, sessionId }])
+
+    await acp.request('session/close', { sessionId })
+    await expect(acp.request('session/prompt', { prompt: [{ text: 'again', type: 'text' }], sessionId })).rejects.toThrow('-32002')
+    await acp.request('session/close', { sessionId })
+  })
+
+  it('reports cancelled when the client cancels a permission request, and cancels work on session/close', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'fwt-acp-v2-cancel-'))
+    cleanups.push(async () => rm(dir, { force: true, recursive: true }))
+
+    const httpServer = await createMockChatServer((_body, _idx, res) => {
+      writeSse(res, [
+        {
+          choices: [{
+            delta: {
+              role: 'assistant',
+              tool_calls: [{
+                function: { arguments: '{"cmd":"echo x"}', name: 'exec_command' },
+                id: 'call_cancel',
+                index: 0,
+                type: 'function',
+              }],
+            },
+            finish_reason: null,
+            index: 0,
+          }],
+        },
+        { choices: [{ delta: {}, finish_reason: 'tool_calls', index: 0 }] },
+      ])
+    })
+    cleanups.push(httpServer.close)
+
+    const acp = createAcpHarness({ baseURL: httpServer.baseURL, cwd: dir, sessionsDir: dir })
+    cleanups.push(acp.close)
+
+    await acp.request('initialize', { info: { name: 'test', version: '0' }, protocolVersion: 2 })
+    const created = await acp.request('session/new', { cwd: dir })
+    const sessionId = created.sessionId as string
+    await acp.request('session/set_config_option', { configId: 'mode', sessionId, type: 'id', value: 'ask' })
+
+    acp.onRequest(() => ({ outcome: { outcome: 'cancelled' } }))
+    await acp.request('session/prompt', { prompt: [{ text: 'go', type: 'text' }], sessionId })
+    await vi.waitFor(() => {
+      const last = acp.notifications.at(-1)?.params?.update
+      expect(last).toMatchObject({ state: 'idle', stopReason: 'cancelled' })
+    })
+
+    acp.onRequest(async () => new Promise(() => {}))
+    await acp.request('session/prompt', { prompt: [{ text: 'go again', type: 'text' }], sessionId })
+    await vi.waitFor(() => {
+      expect(acp.notifications.some(n => (n.params?.update as undefined | { state?: string })?.state === 'requires_action')).toBe(true)
+    })
+    await acp.request('session/close', { sessionId })
+    expect(acp.notifications.at(-1)?.params?.update).toMatchObject({ state: 'idle', stopReason: 'cancelled' })
+  })
+
+  it('accepts resource_link prompt blocks', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'fwt-acp-v2-link-'))
+    cleanups.push(async () => rm(dir, { force: true, recursive: true }))
+
+    const httpServer = await createMockChatServer((_body, _idx, res) => {
+      writeSse(res, [
+        { choices: [{ delta: { content: 'ok', role: 'assistant' }, finish_reason: null, index: 0 }] },
+        { choices: [{ delta: {}, finish_reason: 'stop', index: 0 }] },
+      ])
+    })
+    cleanups.push(httpServer.close)
+
+    const acp = createAcpHarness({ baseURL: httpServer.baseURL, cwd: dir, sessionsDir: dir })
+    cleanups.push(acp.close)
+
+    await acp.request('initialize', { info: { name: 'test', version: '0' }, protocolVersion: 2 })
+    const created = await acp.request('session/new', { cwd: dir })
+    await acp.request('session/prompt', {
+      prompt: [{ name: 'notes', type: 'resource_link', uri: 'file:///notes.md' }],
+      sessionId: created.sessionId,
+    })
+    await vi.waitFor(() => {
+      expect(acp.notifications.at(-1)?.params?.update).toMatchObject({ state: 'idle', stopReason: 'end_turn' })
+    })
+    expect(JSON.stringify(httpServer.requests[0])).toContain('[notes](file:///notes.md)')
+  })
+
+  it('starts a new agent message id for each model step', () => {
+    const map = createAgentEventMapper(2, 's1')
+    const idOf = (note: ReturnType<typeof map>): unknown => (note as NonNullable<typeof note>).params.update
+    const messageIdOf = (note: ReturnType<typeof map>): unknown => (idOf(note) as { messageId: string }).messageId
+    const first = messageIdOf(map({ delta: 'a', type: 'text.delta' }))
+    expect(messageIdOf(map({ delta: 'b', type: 'text.delta' }))).toBe(first)
+    map({ stepNumber: 2, type: 'step.start' })
+    expect(messageIdOf(map({ delta: 'c', type: 'text.delta' }))).not.toBe(first)
   })
 })
 

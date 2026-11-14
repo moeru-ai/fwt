@@ -102,7 +102,6 @@ export const createFwtCli = (options: CreateFwtCliOptions = {}): Cli => {
   const sessionsDir = join(fwtDirs(options.home).state, 'sessions')
   const resolveCwd = (io: CliIo, cwd: string | undefined): string => resolve(io.cwd ?? process.cwd(), cwd ?? '')
   const runAcp = async ({ flags, io, signal }: CommandContext<typeof modelFlags>): Promise<void> => startAcpServer({
-    defaultCwd: resolveCwd(io, flags.cwd),
     input: io.stdin ?? process.stdin,
     maxTurns: flags.maxTurns,
     modelConfig: buildModelInput(flags, options),
