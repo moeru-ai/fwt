@@ -200,7 +200,8 @@ describe('aCP v1 and v2 dual-version server', () => {
 
     const init = await acp.request('initialize', { protocolVersion: 1 })
     expect(init.protocolVersion).toBe(1)
-    expect(init.agentCapabilities).toMatchObject({ loadSession: true })
+    expect(init.agentCapabilities).toMatchObject({ loadSession: true, sessionCapabilities: { resume: {} } })
+    await expect(acp.request('session/resume', { cwd: dir, sessionId: 'missing' })).rejects.toThrow('-32002')
 
     const created = await acp.request('session/new', { cwd: dir })
     const sessionId = created.sessionId as string
@@ -211,7 +212,8 @@ describe('aCP v1 and v2 dual-version server', () => {
       sessionId,
     })
     expect(promptRes.stopReason).toBe('end_turn')
-    expect(promptRes.text).toBe('v1-complete')
+    expect(promptRes._meta).toMatchObject({ text: 'v1-complete' })
+    expect(promptRes).not.toHaveProperty('text')
 
     const methods = acp.notifications.map(n => n.method)
     expect(methods.every(m => m === 'session/update')).toBe(true)
@@ -221,7 +223,7 @@ describe('aCP v1 and v2 dual-version server', () => {
     expect(updateKinds).toContain('agent_message_chunk')
   })
 
-  it('negotiates protocolVersion 2, emits state_update patches, supports ask permissions, and handles session/cancel', async () => {
+  it('negotiates protocolVersion 2, reports state_update, supports ask permissions via config options, cancels, and resumes with replay', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'fwt-acp-v2-'))
     cleanups.push(async () => rm(dir, { force: true, recursive: true }))
 
@@ -262,13 +264,17 @@ describe('aCP v1 and v2 dual-version server', () => {
     const acp = createAcpHarness({ baseURL: httpServer.baseURL, cwd: dir, sessionsDir: dir })
     cleanups.push(acp.close)
 
-    const init = await acp.request('initialize', { protocolVersion: 2 })
+    await expect(acp.request('initialize', { protocolVersion: 0 })).rejects.toThrow('-32022')
+    const init = await acp.request('initialize', { info: { name: 'test', version: '0' }, protocolVersion: 2 })
     expect(init.protocolVersion).toBe(2)
-    expect(init.capabilities).toMatchObject({ modes: { supported: ['auto', 'ask'] } })
+    expect(init.info).toMatchObject({ name: 'fwt' })
 
     const created = await acp.request('session/new', { cwd: dir })
     const sessionId = created.sessionId as string
-    await acp.request('session/set_mode', { modeId: 'ask', sessionId })
+    expect(created.configOptions).toMatchObject([{ configId: 'mode', currentValue: 'auto', type: 'select' }])
+    await expect(acp.request('session/set_mode', { modeId: 'ask', sessionId })).rejects.toThrow('-32601')
+    const configured = await acp.request('session/set_config_option', { configId: 'mode', sessionId, type: 'id', value: 'ask' })
+    expect(configured.configOptions).toMatchObject([{ configId: 'mode', currentValue: 'ask' }])
 
     const permissionRequests: JsonRpcMessage[] = []
     acp.onRequest((msg) => {
@@ -276,33 +282,51 @@ describe('aCP v1 and v2 dual-version server', () => {
       return { outcome: { optionId: 'reject_once', outcome: 'selected' } }
     })
 
+    const updates = (): Record<string, unknown>[] =>
+      acp.notifications.map(n => n.params?.update as Record<string, unknown>)
+    const idleCount = (): number =>
+      updates().filter(u => u.sessionUpdate === 'state_update' && u.state === 'idle').length
+    const waitForIdle = async (count: number): Promise<void> => {
+      while (idleCount() < count) {
+        await new Promise((resolve) => {
+          const timer = setTimeout(resolve, 10)
+          timer.unref()
+        })
+      }
+    }
+
     const promptRes = await acp.request('session/prompt', {
-      prompt: 'try command',
+      prompt: [{ text: 'try command', type: 'text' }],
       sessionId,
     })
-    expect(promptRes.stopReason).toBe('end_turn')
-    expect(promptRes.text).toBe('ok-after-deny')
+    expect(promptRes.messageId).toBeTypeOf('string')
+    await waitForIdle(1)
     expect(permissionRequests).toHaveLength(1)
     expect(permissionRequests[0].method).toBe('session/request_permission')
+    expect(permissionRequests[0].params).toMatchObject({ subject: { toolCall: { name: 'exec_command' }, type: 'tool_call' } })
 
-    const v2Updates = acp.notifications.filter(n => n.method === 'state_update')
-    expect(v2Updates.some(n => n.params?.type === 'tool_call_patch' && n.params?.isError === true)).toBe(true)
+    expect(acp.notifications.every(n => n.method === 'session/update')).toBe(true)
+    expect(updates()).toContainEqual(expect.objectContaining({ messageId: promptRes.messageId, sessionUpdate: 'user_message' }))
+    expect(updates()).toContainEqual(expect.objectContaining({ sessionUpdate: 'state_update', state: 'requires_action' }))
+    expect(updates()).toContainEqual(expect.objectContaining({ sessionUpdate: 'tool_call_update', status: 'failed', toolCallId: 'call_deny' }))
+    expect(updates()).toContainEqual(expect.objectContaining({ content: { text: 'ok-after-deny', type: 'text' }, sessionUpdate: 'agent_message_chunk' }))
+    expect(updates().at(-1)).toMatchObject({ sessionUpdate: 'state_update', state: 'idle', stopReason: 'end_turn' })
 
-    const pendingPrompt = acp.request('session/prompt', {
-      prompt: 'will cancel',
-      sessionId,
-    })
+    await acp.request('session/prompt', { prompt: [{ text: 'will cancel', type: 'text' }], sessionId })
     await new Promise((resolve) => {
       const timer = setTimeout(resolve, 80)
       timer.unref()
     })
     acp.notify('session/cancel', { sessionId })
+    await waitForIdle(2)
+    expect(updates().at(-1)).toMatchObject({ state: 'idle', stopReason: 'cancelled' })
 
-    const cancelledRes = await pendingPrompt
-    expect(cancelledRes.stopReason).toBe('cancelled')
-
-    const resumed = await acp.request('session/resume', { sessionId })
-    expect(resumed.sessionId).toBe(sessionId)
+    const before = acp.notifications.length
+    const resumed = await acp.request('session/resume', { cwd: dir, replayFrom: { type: 'start' }, sessionId })
+    expect(resumed.configOptions).toBeDefined()
+    const resumeUpdates = acp.notifications.slice(before).map(n => n.params?.update as Record<string, unknown>)
+    expect(resumeUpdates.map(u => u.sessionUpdate)).toContain('replay_complete')
+    expect(resumeUpdates.at(-1)).toMatchObject({ sessionUpdate: 'state_update', state: 'idle' })
   })
 })
 

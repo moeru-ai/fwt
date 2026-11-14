@@ -6,6 +6,7 @@ import type { AcpProtocolVersion, AcpServerOptions, PermissionMode, PermissionOu
 
 import process from 'node:process'
 
+import { randomUUID } from 'node:crypto'
 import { createInterface } from 'node:readline'
 
 import * as v from 'valibot'
@@ -15,11 +16,12 @@ import { runAgent } from '../agent'
 import { resolveModel, resolveRecordedModel } from '../providers'
 import { createSessionStore, openSessionStore } from '../session'
 import {
+  createAgentEventMapper,
   extractPromptText,
+  formatModeConfigOption,
   formatModes,
   initializeParamsSchema,
   jsonRpcEnvelopeSchema,
-  mapAgentEventToNotification,
   mapStopReason,
   negotiateProtocolVersion,
   parseParams,
@@ -30,7 +32,10 @@ import {
   sessionLoadParamsSchema,
   sessionNewParamsSchema,
   sessionPromptParamsSchema,
+  sessionResumeParamsSchema,
+  sessionSetConfigOptionParamsSchema,
   sessionSetModeParamsSchema,
+  sessionUpdate,
   toolKind,
 } from './protocol'
 
@@ -49,6 +54,12 @@ interface AcpRuntime {
     sessionId?: string,
     signal?: AbortSignal,
   ) => Promise<unknown>
+  sendSessionState: (
+    sessionId: string,
+    state: 'idle' | 'requires_action' | 'running',
+    stopReason?: string,
+    error?: { code: number, message: string },
+  ) => void
   sessions: Map<string, AcpSessionState>
   sessionsDir: string
   signal?: AbortSignal
@@ -89,6 +100,16 @@ const buildPreToolCall = (
       }
     }
 
+    const toolCall = {
+      kind: toolKind(call.name),
+      rawInput: safeJsonParse(call.arguments),
+      title: call.name,
+      toolCallId: call.callId,
+    }
+    const v2 = runtime.protocolVersion === 2
+    if (v2)
+      runtime.sendSessionState(session.store.id, 'requires_action')
+
     let outcome: PermissionOutcome
     try {
       const response = await runtime.sendRequestToClient(
@@ -101,12 +122,9 @@ const buildPreToolCall = (
             { kind: 'reject_always', name: 'Always reject', optionId: 'reject_always' },
           ],
           sessionId: session.store.id,
-          toolCall: {
-            kind: toolKind(call.name),
-            rawInput: safeJsonParse(call.arguments),
-            title: call.name,
-            toolCallId: call.callId,
-          },
+          ...v2
+            ? { subject: { toolCall: { ...toolCall, name: call.name }, type: 'tool_call' }, title: `Run ${call.name}` }
+            : { toolCall },
         },
         session.store.id,
         signal,
@@ -115,6 +133,8 @@ const buildPreToolCall = (
     }
     catch {
       signal.throwIfAborted()
+      if (v2)
+        runtime.sendSessionState(session.store.id, 'running')
       return {
         callId: call.callId,
         isError: true,
@@ -122,6 +142,9 @@ const buildPreToolCall = (
         type: 'tool-result',
       }
     }
+
+    if (v2 && outcome !== 'cancelled')
+      runtime.sendSessionState(session.store.id, 'running')
 
     if (outcome === 'allow_always') {
       session.toolPolicy.set(call.name, 'allow')
@@ -151,6 +174,7 @@ const handleInitialize = (runtime: AcpRuntime, params: unknown): Record<string, 
       agentCapabilities: {
         loadSession: true,
         promptCapabilities: { image: false },
+        sessionCapabilities: { resume: {} },
       },
       agentInfo: { name: 'fwt', version },
       authMethods: [],
@@ -159,11 +183,9 @@ const handleInitialize = (runtime: AcpRuntime, params: unknown): Record<string, 
   }
 
   return {
-    agentInfo: { name: 'fwt', version },
-    capabilities: {
-      modes: { supported: ['auto', 'ask'] },
-      sessions: { load: true, resume: true },
-    },
+    authMethods: [],
+    capabilities: { session: { prompt: {} } },
+    info: { name: 'fwt', version },
     protocolVersion: 2,
   }
 }
@@ -189,79 +211,98 @@ const handleSessionNew = async (runtime: AcpRuntime, params: unknown): Promise<R
     toolPolicy: new Map(),
   })
 
-  return {
-    modes: formatModes(mode),
-    sessionId: store.id,
-  }
+  return runtime.protocolVersion === 1
+    ? { modes: formatModes(mode), sessionId: store.id }
+    : { configOptions: [formatModeConfigOption(mode)], sessionId: store.id }
 }
 
-const replayAssistantText = (runtime: AcpRuntime, store: SessionStore): void => {
+const sessionNotFound = (sessionId: string, cause?: unknown): RpcError =>
+  Object.assign(new RpcError(-32002, `Session not found: ${sessionId}`, { sessionId }), { cause })
+
+const ensureSession = async (runtime: AcpRuntime, sessionId: string): Promise<AcpSessionState> => {
+  const store = await openSessionStore(sessionId, runtime.sessionsDir).catch((error: unknown) => {
+    throw sessionNotFound(sessionId, error)
+  })
+  let session = runtime.sessions.get(store.id)
+  if (session == null) {
+    session = {
+      model: resolveRecordedModel(runtime.modelConfig ?? {}, store.header),
+      permissionMode: runtime.defaultPermissionMode,
+      store,
+      toolPolicy: new Map(),
+    }
+    runtime.sessions.set(store.id, session)
+  }
+  return session
+}
+
+const replayHistory = (runtime: AcpRuntime, store: SessionStore): void => {
+  const send = (update: Record<string, unknown>): void => {
+    const note = sessionUpdate(store.id, update)
+    runtime.sendNotification(note.method, note.params)
+  }
+  const v1 = runtime.protocolVersion === 1
+
   for (const message of store.messages()) {
-    if (message.role !== 'assistant' || typeof message.content === 'string')
-      continue
-    for (const part of message.content) {
-      if (part.type !== 'text')
-        continue
-      const note = mapAgentEventToNotification(runtime.protocolVersion, store.id, {
-        delta: part.text,
-        type: 'text.delta',
-      })
-      if (note != null)
-        runtime.sendNotification(note.method, note.params)
+    if (message.role === 'user' && typeof message.content === 'string' && !v1) {
+      send({ content: [{ text: message.content, type: 'text' }], messageId: randomUUID(), sessionUpdate: 'user_message' })
+    }
+    else if (message.role === 'assistant' && typeof message.content !== 'string') {
+      for (const part of message.content.filter(part => part.type === 'text')) {
+        send(v1
+          ? { content: { text: part.text, type: 'text' }, sessionUpdate: 'agent_message_chunk' }
+          : { content: [{ text: part.text, type: 'text' }], messageId: randomUUID(), sessionUpdate: 'agent_message' })
+      }
     }
   }
 }
 
-const handleSessionLoad = async (
-  runtime: AcpRuntime,
-  params: unknown,
-  replay: boolean,
-): Promise<Record<string, unknown>> => {
+const handleSessionLoad = async (runtime: AcpRuntime, params: unknown): Promise<Record<string, unknown>> => {
   const parsed = parseParams(sessionLoadParamsSchema, params)
-  const store = await openSessionStore(parsed.sessionId, runtime.sessionsDir)
-  const existing = runtime.sessions.get(store.id)
-  const mode = existing?.permissionMode ?? runtime.defaultPermissionMode
+  const session = await ensureSession(runtime, parsed.sessionId)
+  replayHistory(runtime, session.store)
+  return { modes: formatModes(session.permissionMode), sessionId: session.store.id }
+}
 
-  if (existing == null) {
-    runtime.sessions.set(store.id, {
-      model: resolveRecordedModel(runtime.modelConfig ?? {}, store.header),
-      permissionMode: mode,
-      store,
-      toolPolicy: new Map(),
-    })
+const handleSessionResume = async (runtime: AcpRuntime, params: unknown): Promise<Record<string, unknown>> => {
+  if (runtime.protocolVersion === 1) {
+    const parsed = parseParams(sessionLoadParamsSchema, params)
+    const session = await ensureSession(runtime, parsed.sessionId)
+    return { modes: formatModes(session.permissionMode), sessionId: session.store.id }
   }
 
-  if (replay)
-    replayAssistantText(runtime, store)
-
-  return {
-    modes: formatModes(mode),
-    sessionId: store.id,
+  const parsed = parseParams(sessionResumeParamsSchema, params)
+  const session = await ensureSession(runtime, parsed.sessionId)
+  if (parsed.replayFrom?.type === 'start') {
+    replayHistory(runtime, session.store)
+    const note = sessionUpdate(session.store.id, { sessionUpdate: 'replay_complete' })
+    runtime.sendNotification(note.method, note.params)
   }
+  runtime.sendSessionState(session.store.id, session.activeController == null ? 'idle' : 'running')
+  return { configOptions: [formatModeConfigOption(session.permissionMode)] }
+}
+
+const findSession = (runtime: AcpRuntime, sessionId: string): AcpSessionState => {
+  const session = runtime.sessions.get(sessionId)
+  if (session == null)
+    throw sessionNotFound(sessionId)
+  return session
 }
 
 const handleSessionSetMode = (runtime: AcpRuntime, params: unknown): Record<string, unknown> => {
   const parsed = parseParams(sessionSetModeParamsSchema, params)
-  const session = runtime.sessions.get(parsed.sessionId)
-  if (session == null)
-    throw new RpcError(-32602, `Unknown sessionId: ${parsed.sessionId}`)
-
-  const nextMode = parsed.modeId
-  session.permissionMode = nextMode
-  if (runtime.protocolVersion === 1) {
-    runtime.sendNotification('session/update', {
-      sessionId: session.store.id,
-      update: { currentModeId: nextMode, sessionUpdate: 'current_mode_update' },
-    })
-  }
-  else {
-    runtime.sendNotification('state_update', {
-      currentModeId: nextMode,
-      sessionId: session.store.id,
-      type: 'mode_update',
-    })
-  }
+  const session = findSession(runtime, parsed.sessionId)
+  session.permissionMode = parsed.modeId
+  const note = sessionUpdate(session.store.id, { currentModeId: parsed.modeId, sessionUpdate: 'current_mode_update' })
+  runtime.sendNotification(note.method, note.params)
   return {}
+}
+
+const handleSessionSetConfigOption = (runtime: AcpRuntime, params: unknown): Record<string, unknown> => {
+  const parsed = parseParams(sessionSetConfigOptionParamsSchema, params)
+  const session = findSession(runtime, parsed.sessionId)
+  session.permissionMode = parsed.value
+  return { configOptions: [formatModeConfigOption(parsed.value)] }
 }
 
 const cancelSession = (runtime: AcpRuntime, params: unknown): void => {
@@ -278,9 +319,7 @@ const cancelSession = (runtime: AcpRuntime, params: unknown): void => {
 
 const handleSessionPrompt = async (runtime: AcpRuntime, params: unknown): Promise<Record<string, unknown>> => {
   const parsed = parseParams(sessionPromptParamsSchema, params)
-  const session = runtime.sessions.get(parsed.sessionId)
-  if (session == null)
-    throw new RpcError(-32602, `Unknown sessionId: ${parsed.sessionId}`)
+  const session = findSession(runtime, parsed.sessionId)
   if (session.activeController != null)
     throw new RpcError(-32602, `Session ${parsed.sessionId} already has an active prompt`)
 
@@ -291,30 +330,66 @@ const handleSessionPrompt = async (runtime: AcpRuntime, params: unknown): Promis
     : controller.signal
   session.activeController = controller
 
-  try {
-    const result = await runAgent({
-      cwd: session.store.header.cwd,
-      maxTurns: runtime.maxTurns,
-      model: session.model,
-      onEvent: (event) => {
-        const note = mapAgentEventToNotification(runtime.protocolVersion, session.store.id, event)
-        if (note != null)
-          runtime.sendNotification(note.method, note.params)
-      },
-      preToolCall: buildPreToolCall(runtime, session, linkedSignal),
-      prompt: promptText,
-      sessionStore: session.store,
-      signal: linkedSignal,
-    })
+  const mapEvent = createAgentEventMapper(runtime.protocolVersion, session.store.id)
+  const run = async (): Promise<Awaited<ReturnType<typeof runAgent>>> => {
+    try {
+      return await runAgent({
+        cwd: session.store.header.cwd,
+        maxTurns: runtime.maxTurns,
+        model: session.model,
+        onEvent: (event) => {
+          const note = mapEvent(event)
+          if (note != null)
+            runtime.sendNotification(note.method, note.params)
+        },
+        preToolCall: buildPreToolCall(runtime, session, linkedSignal),
+        prompt: promptText,
+        sessionStore: session.store,
+        signal: linkedSignal,
+      })
+    }
+    finally {
+      if (session.activeController === controller)
+        session.activeController = undefined
+    }
+  }
 
+  if (runtime.protocolVersion === 2) {
+    const messageId = randomUUID()
+    const echo = sessionUpdate(session.store.id, {
+      content: parsed.prompt,
+      messageId,
+      sessionUpdate: 'user_message',
+    })
+    runtime.sendNotification(echo.method, echo.params)
+    runtime.sendSessionState(session.store.id, 'running')
+    void run()
+      .then(result => runtime.sendSessionState(session.store.id, 'idle', mapStopReason(result.stopReason)))
+      .catch((error: unknown) => {
+        if (linkedSignal.aborted) {
+          runtime.sendSessionState(session.store.id, 'idle', 'cancelled')
+          return
+        }
+        runtime.sendSessionState(session.store.id, 'idle', 'error', {
+          code: -32603,
+          message: error instanceof Error ? error.message : 'Internal error',
+        })
+      })
+    return { messageId }
+  }
+
+  try {
+    const result = await run()
     return {
-      stopReason: mapStopReason(result.stopReason),
-      text: result.text,
-      usage: {
-        cacheReadInputTokens: result.cacheStats.totalCacheReadTokens,
-        inputTokens: result.cacheStats.totalInputTokens,
-        outputTokens: result.cacheStats.totalOutputTokens,
+      _meta: {
+        text: result.text,
+        usage: {
+          cacheReadInputTokens: result.cacheStats.totalCacheReadTokens,
+          inputTokens: result.cacheStats.totalInputTokens,
+          outputTokens: result.cacheStats.totalOutputTokens,
+        },
       },
+      stopReason: mapStopReason(result.stopReason),
     }
   }
   catch (error) {
@@ -322,13 +397,15 @@ const handleSessionPrompt = async (runtime: AcpRuntime, params: unknown): Promis
       return { stopReason: 'cancelled' }
     throw error
   }
-  finally {
-    if (session.activeController === controller)
-      session.activeController = undefined
-  }
 }
 
+const v1Only = new Set(['session/load', 'session/set_mode'])
+const v2Only = new Set(['session/set_config_option'])
+
 const dispatchMethod = async (runtime: AcpRuntime, method: string, params: unknown): Promise<unknown> => {
+  if (method !== 'initialize' && (runtime.protocolVersion === 1 ? v2Only : v1Only).has(method))
+    throw new RpcError(-32601, `Method not found: ${method}`)
+
   switch (method) {
     case 'initialize':
       return handleInitialize(runtime, params)
@@ -336,13 +413,15 @@ const dispatchMethod = async (runtime: AcpRuntime, method: string, params: unkno
       cancelSession(runtime, params)
       return {}
     case 'session/load':
-      return handleSessionLoad(runtime, params, true)
+      return handleSessionLoad(runtime, params)
     case 'session/new':
       return handleSessionNew(runtime, params)
     case 'session/prompt':
       return handleSessionPrompt(runtime, params)
     case 'session/resume':
-      return handleSessionLoad(runtime, params, false)
+      return handleSessionResume(runtime, params)
+    case 'session/set_config_option':
+      return handleSessionSetConfigOption(runtime, params)
     case 'session/set_mode':
       return handleSessionSetMode(runtime, params)
     default:
@@ -407,7 +486,8 @@ const handleIncomingLine = (runtime: AcpRuntime, line: string): void => {
     .catch((error: unknown) => {
       const code = error instanceof RpcError ? error.code : -32603
       const message = error instanceof Error ? error.message : 'Internal error'
-      runtime.sendMessage({ error: { code, message }, id: requestId })
+      const data = error instanceof RpcError ? error.data : undefined
+      runtime.sendMessage({ error: { code, ...data != null && { data }, message }, id: requestId })
     })
 }
 
@@ -451,6 +531,15 @@ export const startAcpServer = async (options: AcpServerOptions): Promise<void> =
         signal?.addEventListener('abort', onAbort, { once: true })
         sendMessage({ id, method, params })
       })
+    },
+    sendSessionState: (sessionId, state, stopReason, error) => {
+      const note = sessionUpdate(sessionId, {
+        sessionUpdate: 'state_update',
+        state,
+        ...stopReason != null && { stopReason },
+        ...error != null && { error },
+      })
+      sendMessage({ method: note.method, params: note.params })
     },
     sessions: new Map(),
     sessionsDir: options.sessionsDir,

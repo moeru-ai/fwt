@@ -120,12 +120,15 @@ fwt -p "…" --header "x-trace-id: {session}" --header "x-team: tools"
 
 ## Run fwt as an ACP server
 
-`fwt acp` serves the Agent Client Protocol (ACP) over standard input and standard output. An ACP client, for example an editor, starts the process and sends JSON-RPC requests. fwt supports ACP versions 1 and 2, and these methods:
+`fwt acp` serves the Agent Client Protocol (ACP) over standard input and standard output. An ACP client, for example an editor, starts the process and sends JSON-RPC requests. fwt supports ACP version 1 and ACP version 2 (the `2.0.0-alpha.15` schema). The client picks the version in `initialize`.
 
-- `initialize`
-- `session/new`, `session/load`, and `session/resume`
-- `session/prompt` and `session/cancel`
-- `session/set_mode`
+Both versions support `initialize`, `session/new`, `session/resume`, `session/prompt`, and `session/cancel`. The other methods depend on the version:
+
+| Method | Version 1 | Version 2 |
+| --- | --- | --- |
+| `session/load` | Yes | No. Use `session/resume` with `replayFrom`. |
+| `session/set_mode` | Yes | No. Use `session/set_config_option` with `configId` `mode`. |
+| `session/prompt` result | The stop reason, after the turn ends | A `messageId`, right after fwt accepts the prompt. `state_update` reports `running`, `requires_action`, and `idle` with the stop reason. |
 
 A session has one of two modes. In `auto` mode, which is the default, fwt runs each tool call. In `ask` mode, fwt sends `session/request_permission` to the client before each tool call. To start in `ask` mode, add `--permission-mode ask`.
 

@@ -114,7 +114,7 @@ export const createFwtCli = (options: CreateFwtCliOptions = {}): Cli => {
 
   const acpCommand = defineCommand({
     action: runAcp,
-    description: 'Run the dual-version (v1 + v2) ACP JSON-RPC stdio server',
+    description: 'Run the ACP v1 and v2 JSON-RPC stdio server',
     flags: modelFlags,
     name: 'acp',
   })
