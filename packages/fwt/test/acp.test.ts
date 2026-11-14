@@ -333,7 +333,7 @@ describe('aCP v1 and v2 dual-version server', () => {
     await expect(acp.request('session/resume', { cwd: join(dir, 'other'), sessionId })).rejects.toThrow('-32602')
     await expect(acp.request('session/new', { cwd: 'relative' })).rejects.toThrow('-32602')
     await expect(acp.request('session/prompt', { prompt: [], sessionId })).rejects.toThrow('-32602')
-    await expect(acp.request('session/prompt', { prompt: [{ data: 'x', mimeType: 'image/png', type: 'image' }], sessionId })).rejects.toThrow('-32602')
+    await expect(acp.request('session/prompt', { prompt: [{ data: 'x', mimeType: 'audio/wav', type: 'audio' }], sessionId })).rejects.toThrow('-32602')
 
     const listed = await acp.request('session/list', { cwd: dir })
     expect(listed.sessions).toMatchObject([{ cwd: dir, sessionId }])
@@ -393,8 +393,8 @@ describe('aCP v1 and v2 dual-version server', () => {
     expect(acp.notifications.at(-1)?.params?.update).toMatchObject({ state: 'idle', stopReason: 'cancelled' })
   })
 
-  it('accepts resource_link prompt blocks', async () => {
-    const dir = await mkdtemp(join(tmpdir(), 'fwt-acp-v2-link-'))
+  it('passes resource_link, embedded resource, and image prompt blocks to the model', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'fwt-acp-v2-blocks-'))
     cleanups.push(async () => rm(dir, { force: true, recursive: true }))
 
     const httpServer = await createMockChatServer((_body, _idx, res) => {
@@ -408,16 +408,24 @@ describe('aCP v1 and v2 dual-version server', () => {
     const acp = createAcpHarness({ baseURL: httpServer.baseURL, cwd: dir, sessionsDir: dir })
     cleanups.push(acp.close)
 
-    await acp.request('initialize', { info: { name: 'test', version: '0' }, protocolVersion: 2 })
+    const init = await acp.request('initialize', { info: { name: 'test', version: '0' }, protocolVersion: 2 })
+    expect(init.capabilities).toMatchObject({ session: { prompt: { embeddedContext: {}, image: {} } } })
     const created = await acp.request('session/new', { cwd: dir })
     await acp.request('session/prompt', {
-      prompt: [{ name: 'notes', type: 'resource_link', uri: 'file:///notes.md' }],
+      prompt: [
+        { name: 'notes', type: 'resource_link', uri: 'file:///notes.md' },
+        { resource: { text: 'embedded body', uri: 'file:///a.txt' }, type: 'resource' },
+        { data: 'aGVsbG8=', mimeType: 'image/png', type: 'image' },
+      ],
       sessionId: created.sessionId,
     })
     await vi.waitFor(() => {
       expect(acp.notifications.at(-1)?.params?.update).toMatchObject({ state: 'idle', stopReason: 'end_turn' })
     })
-    expect(JSON.stringify(httpServer.requests[0])).toContain('[notes](file:///notes.md)')
+    const sent = JSON.stringify(httpServer.requests[0])
+    expect(sent).toContain('[notes](file:///notes.md)')
+    expect(sent).toContain('embedded body')
+    expect(sent).toContain('data:image/png;base64,aGVsbG8=')
   })
 
   it('starts a new agent message id for each model step', () => {

@@ -131,7 +131,7 @@ Both versions support `initialize`, `session/new`, `session/resume`, `session/pr
 | `session/list` and `session/close` | No | Yes |
 | `session/prompt` result | The stop reason, after the turn ends | A `messageId`, after fwt writes the user message to the session. `state_update` reports `running`, `requires_action`, and `idle` with the stop reason. |
 
-`session/new`, `session/load`, and `session/resume` need an absolute `cwd`. On resume, `cwd` must be the working directory of the session. A prompt holds text and `resource_link` blocks. fwt rejects other block types with `-32602`.
+`session/new`, `session/load`, and `session/resume` need an absolute `cwd`. On resume, `cwd` must be the working directory of the session. A prompt holds `text`, `resource_link`, text `resource`, and `image` blocks. fwt adds a `resource_link` to the prompt as a Markdown link, and it does not read the file. An `image` block must be PNG, JPEG, GIF, or WebP, and the model must accept image input. fwt rejects other block types with `-32602`.
 
 A session has one of two modes. In `auto` mode, which is the default, fwt runs each tool call. In `ask` mode, fwt sends `session/request_permission` to the client before each tool call. To start in `ask` mode, add `--permission-mode ask`.
 

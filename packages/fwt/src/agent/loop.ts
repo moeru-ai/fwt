@@ -1,4 +1,4 @@
-import type { ImagePart, LanguageModelProviderOptions, Message, PreToolCall, StopCondition, TextEvent, TextPart, ToolCallPart, ToolResultPart, ToolResultPartContent, Usage } from '@xsai/text'
+import type { ImagePart, LanguageModelProviderOptions, Message, PreToolCall, StopCondition, TextEvent, TextPart, ToolCallPart, ToolResultPart, ToolResultPartContent, Usage, UserMessage } from '@xsai/text'
 
 import type { ResolvedModelConfig } from '../providers'
 import type { CacheMissEvent, CacheStatsSnapshot, SessionStore } from '../session'
@@ -44,6 +44,7 @@ interface AgentRunResult {
 
 interface RunAgentOptions {
   cwd: string
+  images?: readonly ImagePart[]
   maxTurns?: number
   model: ResolvedModelConfig
   onEvent?: (event: AgentEvent) => void
@@ -181,13 +182,16 @@ const buildTurnUserMessage = async (
     ? `${activations.join('\n\n')}\n\n${options.prompt}`
     : options.prompt
 
-  if (seedMessages.length > 0)
-    return { content: promptWithActivations, role: 'user' }
+  const message: UserMessage = seedMessages.length > 0
+    ? { content: promptWithActivations, role: 'user' }
+    : buildInitialUserMessage(promptWithActivations, {
+        availableSkillsPrompt: formatAvailableSkills(skills),
+        cwd: options.cwd,
+      })
 
-  return buildInitialUserMessage(promptWithActivations, {
-    availableSkillsPrompt: formatAvailableSkills(skills),
-    cwd: options.cwd,
-  })
+  if (options.images == null || options.images.length === 0 || typeof message.content !== 'string')
+    return message
+  return { content: [{ text: message.content, type: 'text' }, ...options.images], role: 'user' }
 }
 
 export const runAgent = async (options: RunAgentOptions): Promise<AgentRunResult> => {

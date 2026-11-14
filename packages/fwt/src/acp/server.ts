@@ -19,7 +19,6 @@ import { resolveModel, resolveRecordedModel } from '../providers'
 import { createSessionStore, listSessionHeaders, openSessionStore } from '../session'
 import {
   createAgentEventMapper,
-  extractPromptText,
   formatModeConfigOption,
   formatModes,
   initializeParamsSchema,
@@ -28,6 +27,7 @@ import {
   negotiateProtocolVersion,
   parseParams,
   parsePermissionOutcome,
+  parsePromptBlocks,
   RpcError,
   safeJsonParse,
   sessionCancelParamsSchema,
@@ -181,7 +181,7 @@ const handleInitialize = (runtime: AcpRuntime, params: unknown): Record<string, 
     return {
       agentCapabilities: {
         loadSession: true,
-        promptCapabilities: { image: false },
+        promptCapabilities: { embeddedContext: true, image: true },
         sessionCapabilities: { resume: {} },
       },
       agentInfo: { name: 'fwt', version },
@@ -192,7 +192,7 @@ const handleInitialize = (runtime: AcpRuntime, params: unknown): Record<string, 
 
   return {
     authMethods: [],
-    capabilities: { session: { prompt: {} } },
+    capabilities: { session: { prompt: { embeddedContext: {}, image: {} } } },
     info: { name: 'fwt', version },
     protocolVersion: 2,
   }
@@ -430,7 +430,9 @@ const handleSessionPrompt = async (runtime: AcpRuntime, params: unknown): Promis
   if (session.activeController != null)
     throw new RpcError(-32602, `Session ${parsed.sessionId} already has an active prompt`)
 
-  const promptText = extractPromptText(parsed.prompt)
+  const { images, text: promptText } = parsePromptBlocks(parsed.prompt)
+  if (images.length > 0 && !session.model.supportsImageInput)
+    throw new RpcError(-32602, `Model ${session.model.model} does not accept image input`)
   const controller = new AbortController()
   const linkedSignal = runtime.signal != null
     ? AbortSignal.any([runtime.signal, controller.signal])
@@ -442,6 +444,7 @@ const handleSessionPrompt = async (runtime: AcpRuntime, params: unknown): Promis
     try {
       return await runAgent({
         cwd: session.store.header.cwd,
+        images,
         maxTurns: runtime.maxTurns,
         model: session.model,
         onEvent: (event) => {

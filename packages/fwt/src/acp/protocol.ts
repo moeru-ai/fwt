@@ -1,3 +1,5 @@
+import type { ImagePart } from '@xsai/text'
+
 import type { AgentEvent, AgentStopReason } from '../agent'
 import type { AcpProtocolVersion, PermissionMode, PermissionOutcome } from './types'
 
@@ -63,6 +65,15 @@ export const sessionCancelParamsSchema = v.object({
 
 const promptBlockSchema = v.variant('type', [
   v.looseObject({ text: v.string(), type: v.literal('text') }),
+  v.looseObject({
+    data: v.string(),
+    mimeType: v.picklist(['image/gif', 'image/jpeg', 'image/png', 'image/webp']),
+    type: v.literal('image'),
+  }),
+  v.looseObject({
+    resource: v.looseObject({ text: v.string(), uri: v.string() }),
+    type: v.literal('resource'),
+  }),
   v.looseObject({ name: v.string(), type: v.literal('resource_link'), uri: v.string() }),
 ])
 
@@ -122,8 +133,29 @@ export const negotiateProtocolVersion = (requested: number): AcpProtocolVersion 
   return requested === 1 ? 1 : 2
 }
 
-export const extractPromptText = (prompt: v.InferOutput<typeof sessionPromptParamsSchema>['prompt']): string =>
-  prompt.map(block => block.type === 'text' ? block.text : `[${block.name}](${block.uri})`).join('\n')
+export const parsePromptBlocks = (
+  prompt: v.InferOutput<typeof sessionPromptParamsSchema>['prompt'],
+): { images: ImagePart[], text: string } => {
+  const images: ImagePart[] = []
+  const texts: string[] = []
+  for (const block of prompt) {
+    switch (block.type) {
+      case 'image':
+        images.push({ data: `data:${block.mimeType};base64,${block.data}`, type: 'image' })
+        break
+      case 'resource':
+        texts.push(`<resource uri="${block.resource.uri}">\n${block.resource.text}\n</resource>`)
+        break
+      case 'resource_link':
+        texts.push(`[${block.name}](${block.uri})`)
+        break
+      case 'text':
+        texts.push(block.text)
+        break
+    }
+  }
+  return { images, text: texts.join('\n') }
+}
 
 export const parsePermissionOutcome = (value: unknown): PermissionOutcome => {
   const parsed = v.safeParse(permissionResponseSchema, value)
