@@ -1,5 +1,7 @@
 minimumReleaseAgeExcludePrune: true
 trustPolicy: no-downgrade
+trustPolicyExclude:
+  - '@vercel/detect-agent@1.2.7'
 shellEmulator: true
 
 packages:

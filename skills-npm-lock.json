@@ -1,0 +1,34 @@
+{
+  "version": 3,
+  "skills": {
+    "ablation": {
+      "package": "@kwaa/skills",
+      "version": "0.1.0",
+      "skillPath": "skills/ablation/SKILL.md"
+    },
+    "kwaa-typescript-best-practices": {
+      "package": "@kwaa/skills",
+      "version": "0.1.0",
+      "skillPath": "skills/kwaa-typescript-best-practices/SKILL.md"
+    },
+    "kwaa-typescript-infra": {
+      "package": "@kwaa/skills",
+      "version": "0.1.0",
+      "skillPath": "skills/kwaa-typescript-infra/SKILL.md"
+    }
+  },
+  "remote": {
+    "agent-browser": {
+      "package": "@kwaa/skills",
+      "source": "vercel-labs/agent-browser"
+    },
+    "frontend-design": {
+      "package": "@kwaa/skills",
+      "source": "anthropics/skills/skills/frontend-design"
+    },
+    "i-have-adhd": {
+      "package": "@kwaa/skills",
+      "source": "ayghri/i-have-adhd"
+    }
+  }
+}
