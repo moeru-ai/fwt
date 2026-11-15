@@ -444,6 +444,7 @@ const handleSessionPrompt = async (runtime: AcpRuntime, params: unknown): Promis
     try {
       return await runAgent({
         cwd: session.store.header.cwd,
+        home: runtime.modelConfig?.home,
         images,
         maxTurns: runtime.maxTurns,
         model: session.model,

@@ -194,6 +194,7 @@ export const createFwtCli = (options: CreateFwtCliOptions = {}): Cli => {
 
       const result = await runAgent({
         cwd: sessionStore.header.cwd,
+        home: options.home,
         maxTurns: flags.maxTurns,
         model: resolvedModel,
         onEvent: (event) => {

@@ -275,6 +275,12 @@ The model has these tools:
 
 fwt has no tool that edits files. The model edits files with shell commands, for example a Python script on `stdin`.
 
+### Project instructions
+
+On a new session, fwt reads `AGENTS.md` in its configuration directory, the working directory, and each parent directory up to the filesystem root. The configuration directory is `$XDG_CONFIG_HOME/fwt` by default, or `FWT_HOME` when set. It sends the global file first, followed by the files from the root to the working directory. Instructions closer to the working directory take precedence. fwt does not discover files below the working directory.
+
+The initial instructions are saved in the session. A resumed session keeps those instructions, even if the files have changed. Start a new session to load changes.
+
 ### Skills
 
 A skill is a directory with a `SKILL.md` file. The file gives the model instructions for one kind of task. fwt reads skills from two directories:

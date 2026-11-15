@@ -5,9 +5,12 @@ import type { CacheMissEvent, CacheStatsSnapshot, SessionStore } from '../sessio
 import type { Skill } from './skills'
 
 import { randomUUID } from 'node:crypto'
+import { readFile } from 'node:fs/promises'
+import { dirname, join, resolve } from 'node:path'
 
 import { streamText } from '@xsai/text'
 
+import { fwtDirs } from '../home'
 import { createCacheStats } from '../session'
 import { createExecManager, createTools } from '../tools'
 import { buildInitialUserMessage, STATIC_SYSTEM_PROMPT } from './prompt'
@@ -18,6 +21,31 @@ import {
   formatAvailableSkills,
   formatSkillActivation,
 } from './skills'
+
+const readAgentsInstructions = async (cwd: string, home?: string): Promise<string> => {
+  const directories: string[] = []
+  let directory = resolve(cwd)
+  for (;;) {
+    directories.push(directory)
+    const parent = dirname(directory)
+    if (parent === directory)
+      break
+    directory = parent
+  }
+  const instructions: string[] = []
+  for (const dir of new Set([fwtDirs(home).config, ...directories.toReversed()])) {
+    try {
+      const contents = await readFile(join(dir, 'AGENTS.md'), 'utf8')
+      if (contents.trim() !== '')
+        instructions.push(`# AGENTS.md instructions for ${dir}\n<INSTRUCTIONS>\n${contents}\n</INSTRUCTIONS>`)
+    }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT')
+        throw error
+    }
+  }
+  return instructions.join('\n\n')
+}
 
 const MAX_LOOP_REPEATS = 3
 const CONTEXT_WARNING_RATIO = 0.85
@@ -44,6 +72,7 @@ interface AgentRunResult {
 
 interface RunAgentOptions {
   cwd: string
+  home?: string
   images?: readonly ImagePart[]
   maxTurns?: number
   model: ResolvedModelConfig
@@ -185,6 +214,7 @@ const buildTurnUserMessage = async (
   const message: UserMessage = seedMessages.length > 0
     ? { content: promptWithActivations, role: 'user' }
     : buildInitialUserMessage(promptWithActivations, {
+        agentsInstructions: await readAgentsInstructions(options.cwd, options.home),
         availableSkillsPrompt: formatAvailableSkills(skills),
         cwd: options.cwd,
       })

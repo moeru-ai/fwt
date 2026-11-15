@@ -304,6 +304,16 @@ describe('runAgent multi-protocol integration', () => {
 
   it('preserves byte-identical message prefixes across JSONL resume and detects cache misses', async () => {
     const dir = await makeTempDir()
+    const cwd = join(dir, 'project', 'nested')
+    const home = join(dir, 'config')
+    await mkdir(cwd, { recursive: true })
+    await mkdir(home)
+    await writeFile(join(home, 'AGENTS.md'), 'global instruction')
+    await writeFile(join(dir, 'AGENTS.md'), 'parent instruction')
+    await writeFile(join(dir, 'project', 'AGENTS.md'), 'project instruction')
+    await writeFile(join(cwd, 'AGENTS.md'), 'nested instruction')
+    await writeFile(join(cwd, 'AGENTS.override.md'), 'ignored override')
+    await writeFile(join(cwd, 'CLAUDE.md'), 'ignored claude')
     const server = await startServer((_body, idx, res) => {
       if (idx === 0) {
         writeSse(res, [
@@ -332,7 +342,7 @@ describe('runAgent multi-protocol integration', () => {
     })
 
     const store = await createSessionStore({
-      cwd: dir,
+      cwd,
       id: 'resume-prefix',
       model: 'deepseek-chat',
       protocol: 'chat',
@@ -340,13 +350,24 @@ describe('runAgent multi-protocol integration', () => {
       sessionsDir: dir,
     })
 
-    await runAgent({ cwd: dir, model, prompt: 'first', sessionStore: store, skills: [] })
+    await runAgent({ cwd, home, model, prompt: 'first', sessionStore: store, skills: [] })
     const firstTurnMessages = server.requests[0].messages as unknown[]
+    const firstTurn = JSON.stringify(firstTurnMessages)
+    expect(firstTurn.indexOf('global instruction')).toBeGreaterThan(-1)
+    expect(firstTurn.indexOf('global instruction')).toBeLessThan(firstTurn.indexOf('parent instruction'))
+    expect(firstTurn.indexOf('parent instruction')).toBeGreaterThan(-1)
+    expect(firstTurn.indexOf('parent instruction')).toBeLessThan(firstTurn.indexOf('project instruction'))
+    expect(firstTurn.indexOf('project instruction')).toBeLessThan(firstTurn.indexOf('nested instruction'))
+    expect(firstTurn).not.toContain('ignored override')
+    expect(firstTurn).not.toContain('ignored claude')
+    await writeFile(join(cwd, 'AGENTS.md'), 'changed instruction')
+    await writeFile(join(home, 'AGENTS.md'), 'changed global instruction')
 
     const resumedStore = await openSessionStore('resume-prefix', dir)
     const events: AgentEvent[] = []
     const resumedResult = await runAgent({
-      cwd: dir,
+      cwd,
+      home,
       model,
       onEvent: event => events.push(event),
       prompt: 'second',
@@ -356,6 +377,8 @@ describe('runAgent multi-protocol integration', () => {
 
     const secondTurnMessages = server.requests[1].messages as unknown[]
     expect(JSON.stringify(secondTurnMessages.slice(0, firstTurnMessages.length))).toBe(JSON.stringify(firstTurnMessages))
+    expect(JSON.stringify(secondTurnMessages)).not.toContain('changed instruction')
+    expect(JSON.stringify(secondTurnMessages)).not.toContain('changed global instruction')
     expect(resumedResult.cacheStats.misses).toHaveLength(1)
     expect(resumedResult.cacheStats.misses[0].missedTokens).toBe(2000)
     expect(events.some(event => event.type === 'cache.miss')).toBe(true)
