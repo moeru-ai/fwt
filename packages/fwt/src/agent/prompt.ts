@@ -13,9 +13,11 @@ Rules:
 
 export const buildInitialUserMessage = (
   prompt: string,
-  options: { availableSkillsPrompt?: string, cwd: string },
+  options: { agentsInstructions?: string, availableSkillsPrompt?: string, cwd: string },
 ): UserMessage => {
   const sections = [`<environment_context>\ncwd: ${options.cwd}\nplatform: ${process.platform}\n</environment_context>`]
+  if (options.agentsInstructions != null && options.agentsInstructions !== '')
+    sections.push(options.agentsInstructions)
   if (options.availableSkillsPrompt != null && options.availableSkillsPrompt !== '')
     sections.push(options.availableSkillsPrompt)
   sections.push(prompt)
