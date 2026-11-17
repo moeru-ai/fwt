@@ -1,7 +1,6 @@
-import type { ImagePart } from '@xsai/text'
+import type { ImagePart, ToolCallPart, ToolResultPart } from '@xsai/text'
 
 import type { AgentEvent, AgentStopReason } from '../agent'
-import type { AcpProtocolVersion, PermissionMode, PermissionOutcome } from './types'
 
 import { randomUUID } from 'node:crypto'
 import { isAbsolute } from 'node:path'
@@ -16,6 +15,12 @@ export const jsonRpcEnvelopeSchema = v.looseObject({
   params: v.optional(v.unknown()),
   result: v.optional(v.unknown()),
 })
+
+export type AcpProtocolVersion = 1 | 2
+
+const permissionModeSchema = v.picklist(['ask', 'auto'])
+
+export type PermissionMode = v.InferOutput<typeof permissionModeSchema>
 
 const absolutePathSchema = v.pipe(v.string(), v.check(isAbsolute, 'Expected an absolute path'))
 
@@ -51,11 +56,11 @@ export const sessionSetConfigOptionParamsSchema = v.object({
   configId: v.literal('mode'),
   sessionId: v.string(),
   type: v.literal('id'),
-  value: v.picklist(['ask', 'auto']),
+  value: permissionModeSchema,
 })
 
 export const sessionSetModeParamsSchema = v.object({
-  modeId: v.picklist(['ask', 'auto']),
+  modeId: permissionModeSchema,
   sessionId: v.string(),
 })
 
@@ -82,10 +87,14 @@ export const sessionPromptParamsSchema = v.object({
   sessionId: v.string(),
 })
 
+const permissionOptionSchema = v.picklist(['allow_always', 'allow_once', 'reject_always', 'reject_once'])
+
+export type PermissionOutcome = 'cancelled' | v.InferOutput<typeof permissionOptionSchema>
+
 const permissionResponseSchema = v.object({
   outcome: v.variant('outcome', [
     v.object({
-      optionId: v.picklist(['allow_always', 'allow_once', 'reject_always', 'reject_once']),
+      optionId: permissionOptionSchema,
       outcome: v.literal('selected'),
     }),
     v.object({ outcome: v.literal('cancelled') }),
@@ -103,7 +112,7 @@ export class RpcError extends Error {
   }
 }
 
-export const toolKind = (name: string): 'execute' | 'read' => name === 'view_image' ? 'read' : 'execute'
+const toolKind = (name: string): 'execute' | 'read' => name === 'view_image' ? 'read' : 'execute'
 
 export const parseParams = <TSchema extends v.BaseSchema<unknown, unknown, v.BaseIssue<unknown>>>(
   schema: TSchema,
@@ -118,7 +127,7 @@ export const parseParams = <TSchema extends v.BaseSchema<unknown, unknown, v.Bas
   return parsed.output
 }
 
-export const safeJsonParse = (raw: string): unknown => {
+const safeJsonParse = (raw: string): unknown => {
   try {
     return JSON.parse(raw)
   }
@@ -179,72 +188,15 @@ export const mapStopReason = (reason: AgentStopReason): string => {
   }
 }
 
-export const formatModes = (currentModeId: PermissionMode): {
-  availableModes: { description: string, id: PermissionMode, name: string }[]
-  currentModeId: PermissionMode
-} => ({
-  availableModes: [
-    { description: 'Run tools locally without confirmation prompts.', id: 'auto', name: 'Auto' },
-    { description: 'Request permission before running each tool.', id: 'ask', name: 'Ask' },
-  ],
+const MODES = [
+  { description: 'Run tools locally without confirmation prompts.', id: 'auto', name: 'Auto' },
+  { description: 'Request permission before running each tool.', id: 'ask', name: 'Ask' },
+] as const satisfies readonly { description: string, id: PermissionMode, name: string }[]
+
+export const formatModes = (currentModeId: PermissionMode): Record<string, unknown> => ({
+  availableModes: MODES,
   currentModeId,
 })
-
-const mapAgentEventV1 = (
-  sessionId: string,
-  event: AgentEvent,
-): AcpNotification | undefined => {
-  switch (event.type) {
-    case 'cache.miss':
-    case 'step.end':
-    case 'step.start':
-      return undefined
-    case 'reasoning.delta':
-      return {
-        method: 'session/update',
-        params: {
-          sessionId,
-          update: { content: { text: event.delta, type: 'text' }, sessionUpdate: 'agent_thought_chunk' },
-        },
-      }
-    case 'text.delta':
-      return {
-        method: 'session/update',
-        params: {
-          sessionId,
-          update: { content: { text: event.delta, type: 'text' }, sessionUpdate: 'agent_message_chunk' },
-        },
-      }
-    case 'tool.call':
-      return {
-        method: 'session/update',
-        params: {
-          sessionId,
-          update: {
-            kind: toolKind(event.call.name),
-            rawInput: safeJsonParse(event.call.arguments),
-            sessionUpdate: 'tool_call',
-            status: 'in_progress',
-            title: event.call.name,
-            toolCallId: event.call.callId,
-          },
-        },
-      }
-    case 'tool.result':
-      return {
-        method: 'session/update',
-        params: {
-          sessionId,
-          update: {
-            rawOutput: event.result.output,
-            sessionUpdate: 'tool_call_update',
-            status: event.result.isError === true ? 'failed' : 'completed',
-            toolCallId: event.result.callId,
-          },
-        },
-      }
-  }
-}
 
 export interface AcpNotification {
   method: 'session/update'
@@ -261,60 +213,56 @@ export const formatModeConfigOption = (currentValue: PermissionMode): Record<str
   configId: 'mode',
   currentValue,
   name: 'Mode',
-  options: [
-    { description: 'Run tools locally without confirmation prompts.', name: 'Auto', value: 'auto' },
-    { description: 'Request permission before running each tool.', name: 'Ask', value: 'ask' },
-  ],
+  options: MODES.map(({ description, id, name }) => ({ description, name, value: id })),
   type: 'select',
+})
+
+export const toolCallFields = (call: ToolCallPart, version: AcpProtocolVersion): Record<string, unknown> => ({
+  kind: toolKind(call.name),
+  ...version === 2 && { name: call.name },
+  rawInput: safeJsonParse(call.arguments),
+  title: call.name,
+  toolCallId: call.callId,
+})
+
+export const toolCallUpdate = (call: ToolCallPart, version: AcpProtocolVersion): Record<string, unknown> => ({
+  ...toolCallFields(call, version),
+  sessionUpdate: version === 1 ? 'tool_call' : 'tool_call_update',
+  status: 'in_progress',
+})
+
+export const toolResultUpdate = (result: ToolResultPart): Record<string, unknown> => ({
+  rawOutput: result.output,
+  sessionUpdate: 'tool_call_update',
+  status: result.isError === true ? 'failed' : 'completed',
+  toolCallId: result.callId,
 })
 
 export const createAgentEventMapper = (
   version: AcpProtocolVersion,
   sessionId: string,
 ): ((event: AgentEvent) => AcpNotification | undefined) => {
-  if (version === 1)
-    return event => mapAgentEventV1(sessionId, event)
-
   let messageId = randomUUID()
   let thoughtId = randomUUID()
+  const chunk = (sessionUpdateKind: string, text: string, id: string): AcpNotification =>
+    sessionUpdate(sessionId, { content: { text, type: 'text' }, ...version === 2 && { messageId: id }, sessionUpdate: sessionUpdateKind })
   return (event) => {
     switch (event.type) {
       case 'cache.miss':
       case 'step.end':
         return undefined
       case 'reasoning.delta':
-        return sessionUpdate(sessionId, {
-          content: { text: event.delta, type: 'text' },
-          messageId: thoughtId,
-          sessionUpdate: 'agent_thought_chunk',
-        })
+        return chunk('agent_thought_chunk', event.delta, thoughtId)
       case 'step.start':
         messageId = randomUUID()
         thoughtId = randomUUID()
         return undefined
       case 'text.delta':
-        return sessionUpdate(sessionId, {
-          content: { text: event.delta, type: 'text' },
-          messageId,
-          sessionUpdate: 'agent_message_chunk',
-        })
+        return chunk('agent_message_chunk', event.delta, messageId)
       case 'tool.call':
-        return sessionUpdate(sessionId, {
-          kind: toolKind(event.call.name),
-          name: event.call.name,
-          rawInput: safeJsonParse(event.call.arguments),
-          sessionUpdate: 'tool_call_update',
-          status: 'in_progress',
-          title: event.call.name,
-          toolCallId: event.call.callId,
-        })
+        return sessionUpdate(sessionId, toolCallUpdate(event.call, version))
       case 'tool.result':
-        return sessionUpdate(sessionId, {
-          rawOutput: event.result.output,
-          sessionUpdate: 'tool_call_update',
-          status: event.result.isError === true ? 'failed' : 'completed',
-          toolCallId: event.result.callId,
-        })
+        return sessionUpdate(sessionId, toolResultUpdate(event.result))
     }
   }
 }

@@ -2,7 +2,6 @@ import type { Cli, CliIo, CommandContext } from '@moeru/cliff'
 
 import type { AgentStopReason } from './agent'
 import type { ModelConfigInput, WireProtocol } from './providers'
-import type { SessionStore } from './session'
 
 import process from 'node:process'
 
@@ -17,7 +16,7 @@ import { version } from '../package.json' with { type: 'json' }
 import { startAcpServer } from './acp'
 import { runAgent } from './agent'
 import { fwtDirs } from './home'
-import { addProvider, listProviders, removeProvider, resolveModel, resolveRecordedModel } from './providers'
+import { addProvider, listProviders, nonEmpty, positiveInteger, removeProvider, resolveModel, resolveRecordedModel } from './providers'
 import { createSessionStore, forkSessionStore, openSessionStore } from './session'
 import { readImageFile } from './tools'
 
@@ -26,6 +25,8 @@ interface CreateFwtCliOptions {
   home?: string
   modelsDevUrl?: string
 }
+
+const positiveIntegerFlag = v.optional(v.pipe(v.string(), v.toNumber(), positiveInteger))
 
 const modelFlags = defineFlags([
   { description: 'Working directory for workspace commands', flag: '--cwd <path>' },
@@ -38,7 +39,7 @@ const modelFlags = defineFlags([
   {
     description: 'Context window in tokens, overriding config.toml and models.dev (default: 250000)',
     flag: '--context-length <tokens>',
-    schema: v.optional(v.pipe(v.string(), v.toNumber(), v.integer(), v.minValue(1))),
+    schema: positiveIntegerFlag,
   },
   {
     description: 'Extra HTTP header "name: value"; repeatable, and {session} becomes the session ID',
@@ -55,7 +56,7 @@ const modelFlags = defineFlags([
   {
     description: 'Maximum model steps per prompt (default: no limit)',
     flag: '--max-turns <count>',
-    schema: v.optional(v.pipe(v.string(), v.toNumber(), v.integer(), v.minValue(1))),
+    schema: positiveIntegerFlag,
   },
 ])
 
@@ -130,37 +131,19 @@ export const createFwtCli = (options: CreateFwtCliOptions = {}): Cli => {
   const sessionsDir = join(fwtDirs(options.home).state, 'sessions')
   const resolveCwd = (io: CliIo, cwd: string | undefined): string => resolve(io.cwd ?? process.cwd(), cwd ?? '')
   const getRunSession = async (flags: Parameters<typeof buildModelInput>[0] & { cwd?: string, fork?: string, resume?: string }, io: CliIo) => {
-    if (flags.resume != null && flags.resume !== '' && flags.fork != null && flags.fork !== '')
+    const resume = nonEmpty(flags.resume)
+    const fork = nonEmpty(flags.fork)
+    if (resume != null && fork != null)
       throw new UsageError('--resume and --fork cannot be used together.')
     const runCwd = resolveCwd(io, flags.cwd)
-    const sessionRef = flags.resume != null && flags.resume !== '' ? flags.resume : flags.fork
-    const source = sessionRef == null || sessionRef === '' ? undefined : await openSessionStore(sessionRef, sessionsDir, runCwd)
+    const sessionRef = resume ?? fork
+    const source = sessionRef == null ? undefined : await openSessionStore(sessionRef, sessionsDir, runCwd)
     const modelInput = buildModelInput(flags, options)
     const model = source == null ? resolveModel(modelInput) : resolveRecordedModel(modelInput, source.header)
-    let sessionStore: SessionStore
-
-    if (flags.fork != null && flags.fork !== '' && source != null) {
-      sessionStore = await forkSessionStore(source, {
-        cwd: flags.cwd == null ? undefined : runCwd,
-        model: model.model,
-        protocol: model.protocol,
-        provider: model.provider,
-        sessionsDir,
-      })
-    }
-    else if (source == null) {
-      sessionStore = await createSessionStore({
-        cwd: runCwd,
-        model: model.model,
-        protocol: model.protocol,
-        provider: model.provider,
-        sessionsDir,
-      })
-    }
-    else {
-      sessionStore = source
-    }
-
+    const recorded = { model: model.model, protocol: model.protocol, provider: model.provider, sessionsDir }
+    const sessionStore = source == null
+      ? await createSessionStore({ ...recorded, cwd: runCwd })
+      : fork == null ? source : await forkSessionStore(source, { ...recorded, cwd: flags.cwd == null ? undefined : runCwd })
     return { model, previousCwd: source?.header.cwd, sessionStore }
   }
   const runAcp = async ({ flags, io, signal }: CommandContext<typeof modelFlags>): Promise<void> => startAcpServer({

@@ -3,7 +3,7 @@ import type { Message, PreToolCall, ToolCallPart, ToolResultPart } from '@xsai/t
 import type { AgentStopReason } from '../agent'
 import type { ModelConfigInput, ResolvedModelConfig } from '../providers'
 import type { SessionStore } from '../session'
-import type { AcpProtocolVersion, AcpServerOptions, PermissionMode, PermissionOutcome } from './types'
+import type { AcpProtocolVersion, PermissionMode, PermissionOutcome } from './protocol'
 
 import process from 'node:process'
 
@@ -29,7 +29,6 @@ import {
   parsePermissionOutcome,
   parsePromptBlocks,
   RpcError,
-  safeJsonParse,
   sessionCancelParamsSchema,
   sessionCloseParamsSchema,
   sessionListParamsSchema,
@@ -40,7 +39,9 @@ import {
   sessionSetConfigOptionParamsSchema,
   sessionSetModeParamsSchema,
   sessionUpdate,
-  toolKind,
+  toolCallFields,
+  toolCallUpdate,
+  toolResultUpdate,
 } from './protocol'
 
 interface AcpRuntime {
@@ -64,6 +65,16 @@ interface AcpRuntime {
     error?: { code: number, message: string },
   ) => void
   sessions: Map<string, AcpSessionState>
+  sessionsDir: string
+  signal?: AbortSignal
+}
+
+interface AcpServerOptions {
+  input?: NodeJS.ReadableStream
+  maxTurns?: number
+  modelConfig?: ModelConfigInput
+  output?: { write: (chunk: string) => unknown }
+  permissionMode?: PermissionMode
   sessionsDir: string
   signal?: AbortSignal
 }
@@ -104,12 +115,7 @@ const buildPreToolCall = (
       }
     }
 
-    const toolCall = {
-      kind: toolKind(call.name),
-      rawInput: safeJsonParse(call.arguments),
-      title: call.name,
-      toolCallId: call.callId,
-    }
+    const toolCall = toolCallFields(call, runtime.protocolVersion)
     const v2 = runtime.protocolVersion === 2
     if (v2)
       runtime.sendSessionState(session.store.id, 'requires_action')
@@ -127,7 +133,7 @@ const buildPreToolCall = (
           ],
           sessionId: session.store.id,
           ...v2
-            ? { subject: { toolCall: { ...toolCall, name: call.name }, type: 'tool_call' }, title: `Run ${call.name}` }
+            ? { subject: { toolCall, type: 'tool_call' }, title: `Run ${call.name}` }
             : { toolCall },
         },
         session.store.id,
@@ -268,25 +274,10 @@ const replayMessageV2 = (message: Message, messageId: string, send: SendUpdate):
     send({ content, messageId, sessionUpdate: 'agent_message' })
 
   for (const part of parts) {
-    if (part.type === 'tool-call') {
-      send({
-        kind: toolKind(part.name),
-        name: part.name,
-        rawInput: safeJsonParse(part.arguments),
-        sessionUpdate: 'tool_call_update',
-        status: 'in_progress',
-        title: part.name,
-        toolCallId: part.callId,
-      })
-    }
-    else if (part.type === 'tool-result') {
-      send({
-        rawOutput: part.output,
-        sessionUpdate: 'tool_call_update',
-        status: part.isError === true ? 'failed' : 'completed',
-        toolCallId: part.callId,
-      })
-    }
+    if (part.type === 'tool-call')
+      send(toolCallUpdate(part, 2))
+    else if (part.type === 'tool-result')
+      send(toolResultUpdate(part))
   }
 }
 

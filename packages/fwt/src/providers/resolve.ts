@@ -233,7 +233,7 @@ const withStreamRetry = (model: LanguageModel): LanguageModel => (options) => {
   }, { highWaterMark: 0 })
 }
 
-const nonEmpty = (value: string | undefined): string | undefined =>
+export const nonEmpty = (value: string | undefined): string | undefined =>
   value != null && value !== '' ? value : undefined
 
 const envContextLength = (): number | undefined => {

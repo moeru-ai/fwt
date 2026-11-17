@@ -70,7 +70,6 @@ interface HeadTailBuffer {
 interface HeadTailSnapshot {
   head: Uint8Array
   omittedBytes: number
-  retainedBytes: number
   tail: Uint8Array
   totalBytes: number
 }
@@ -80,38 +79,6 @@ interface WriteStdinInput {
   maxOutputTokens?: number
   sessionId: number
   yieldTimeMs?: number
-}
-
-const utf8CharLength = (leadByte: number): number => {
-  if ((leadByte & 0x80) === 0)
-    return 1
-  if ((leadByte & 0xE0) === 0xC0)
-    return 2
-  if ((leadByte & 0xF0) === 0xE0)
-    return 3
-  if ((leadByte & 0xF8) === 0xF0)
-    return 4
-  return 1
-}
-
-const sliceUtf8Head = (bytes: Uint8Array, limit: number): Uint8Array => {
-  const end = Math.min(bytes.length, limit)
-  if (end === 0)
-    return bytes.subarray(0, 0)
-
-  let pos = end - 1
-  const minPos = Math.max(0, end - 4)
-  while (pos > minPos && (bytes[pos] & 0xC0) === 0x80)
-    pos -= 1
-
-  if ((bytes[pos] & 0xC0) === 0x80)
-    return bytes.subarray(0, pos)
-
-  const expectedLen = utf8CharLength(bytes[pos])
-  if (pos + expectedLen > end)
-    return bytes.subarray(0, pos)
-
-  return bytes.subarray(0, end)
 }
 
 const sliceUtf8Tail = (bytes: Uint8Array, limit: number): Uint8Array => {
@@ -180,40 +147,25 @@ export const createHeadTailBuffer = (maxBytes: number): HeadTailBuffer => {
   const snapshot = (): HeadTailSnapshot => {
     const head = Buffer.concat(headChunks)
     const tail = Buffer.concat(tailChunks)
-    const retainedBytes = head.length + tail.length
-    return {
-      head,
-      omittedBytes,
-      retainedBytes,
-      tail,
-      totalBytes: retainedBytes + omittedBytes,
-    }
+    return { head, omittedBytes, tail, totalBytes: head.length + tail.length + omittedBytes }
   }
 
   return { push, snapshot }
 }
 
 const formatSnapshot = (
-  snapshot: HeadTailSnapshot,
+  { head, omittedBytes, tail, totalBytes }: HeadTailSnapshot,
   maxBytes: number,
 ): { omittedBytes: number, output: string, totalBytes: number } => {
-  const { totalBytes } = snapshot
-  const fits = snapshot.retainedBytes <= maxBytes
-  if (snapshot.omittedBytes === 0 && fits)
-    return { omittedBytes: 0, output: Buffer.concat([snapshot.head, snapshot.tail]).toString('utf8'), totalBytes }
+  const whole = omittedBytes === 0 ? Buffer.concat([head, tail]) : undefined
+  if (whole != null && whole.length <= maxBytes)
+    return { omittedBytes: 0, output: whole.toString('utf8'), totalBytes }
 
-  const [fullHead, fullTail] = snapshot.omittedBytes === 0
-    ? [Buffer.concat([snapshot.head, snapshot.tail]), Buffer.concat([snapshot.head, snapshot.tail])]
-    : [snapshot.head, snapshot.tail]
   const headBudget = Math.floor(maxBytes / 2)
-  const head = fits ? fullHead : sliceUtf8Head(fullHead, headBudget)
-  const tail = fits ? fullTail : sliceUtf8Tail(fullTail, maxBytes - headBudget)
-  const omittedBytes = totalBytes - head.length - tail.length
-  return {
-    omittedBytes,
-    output: `${Buffer.from(head).toString('utf8')}\n...${omittedBytes} bytes omitted...\n${Buffer.from(tail).toString('utf8')}`,
-    totalBytes,
-  }
+  const headText = new TextDecoder().decode((whole ?? head).subarray(0, headBudget), { stream: true })
+  const tailText = Buffer.from(sliceUtf8Tail(whole ?? tail, maxBytes - headBudget)).toString('utf8')
+  const shownOmitted = totalBytes - Buffer.byteLength(headText) - Buffer.byteLength(tailText)
+  return { omittedBytes: shownOmitted, output: `${headText}\n...${shownOmitted} bytes omitted...\n${tailText}`, totalBytes }
 }
 
 const clampYieldTime = (ms: number): number =>
