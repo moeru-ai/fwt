@@ -12,6 +12,7 @@ words:
   - apos
   - behaviour
   - bumpp
+  - bubblewrap
   - COLORTERM
   - commandcode
   - deepseek
@@ -36,6 +37,7 @@ words:
   - Pocock
   - Runta
   - smol
+  - socat
   - tsdown
   - unstub
   - valibot

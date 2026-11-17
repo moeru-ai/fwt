@@ -6,6 +6,8 @@ import type { Skill } from './skills'
 
 import { streamText } from '@xsai/text'
 
+import { fwtDirs } from '../home'
+import { readConfig } from '../providers'
 import { createExecManager, createTools } from '../tools'
 import { buildActiveMessages, compactIfNeeded, contextBudget } from './compaction'
 import { buildInitialUserMessage, STATIC_SYSTEM_PROMPT, toWireRequest } from './prompt'
@@ -111,7 +113,7 @@ export const runAgent = async (options: RunAgentOptions): Promise<AgentRunResult
   options.signal?.throwIfAborted()
 
   const { model, sessionStore: store } = options
-  const execManager = createExecManager({ defaultCwd: options.cwd })
+  const execManager = createExecManager({ defaultCwd: options.cwd, shell: readConfig(fwtDirs(options.home)).shell })
   const tools = createTools({ cwd: options.cwd, execManager, supportsImageInput: model.supportsImageInput })
   const languageModel = model.languageModel(store.id)
   const providerOptions = model.protocol === 'messages' ? { messages: { cacheControl: { type: 'ephemeral' as const } } } : undefined

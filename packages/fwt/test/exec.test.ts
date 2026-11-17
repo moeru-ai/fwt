@@ -65,6 +65,14 @@ describe('createExecManager', () => {
     }
   })
 
+  it('runs commands through the configured shell program and its arguments', async () => {
+    const manager = createExecManager({ shell: ['env', 'FWT_SHELL_PREFIX=set', '/bin/sh'] })
+    managers.push(manager)
+    const result = await manager.execCommand({ cmd: 'printf "$FWT_SHELL_PREFIX"' })
+
+    expect(result.output).toBe('set')
+  })
+
   it('captures stdout, stderr, and exit codes for one-shot commands', async () => {
     const manager = makeManager()
     const result = await manager.execCommand({

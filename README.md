@@ -55,6 +55,35 @@ npx skills add moeru-ai/fwt
 
 Then ask your coding agent to give a task to fwt.
 
+## Run commands in a sandbox
+
+fwt runs each command with `bash -c <command>`. To run commands in a sandbox, set `shell` in `~/.config/fwt/config.toml` to a program that also accepts `-c <command>`. fwt itself does not include a sandbox, and the model requests, API keys, and session files stay outside it.
+
+For example, [sandbox-runtime](https://github.com/anthropics/sandbox-runtime) (`srt`) limits file writes and network access. On Linux it needs `bubblewrap` and `socat`:
+
+```sh
+npm install -g @anthropic-ai/sandbox-runtime
+```
+
+```toml
+shell = [
+  "srt",
+  "--settings",
+  "/home/me/.config/fwt/srt.json"
+]
+```
+
+This `srt.json` lets commands write only in one project directory and blocks the network:
+
+```json
+{
+  "filesystem": { "allowWrite": ["/home/me/project"], "denyRead": [], "denyWrite": [] },
+  "network": { "allowedDomains": [], "deniedDomains": [] }
+}
+```
+
+Use absolute paths in `srt.json`. srt resolves a relative path from the directory where the command starts, which can be a subdirectory.
+
 ## Documentation
 
 [The `fwt` command](packages/fwt/README.md) tells you how to add providers and run tasks. It also lists the flags, the environment variables, and the files.

@@ -40,6 +40,7 @@ export type ProviderConfig = v.InferOutput<typeof providerConfigSchema>
 const configSchema = v.strictObject({
   provider: v.optional(v.string()),
   providers: v.optional(v.record(v.string(), providerConfigSchema), {}),
+  shell: v.optional(v.tupleWithRest([v.string()], v.string())),
 })
 
 type Config = v.InferOutput<typeof configSchema>

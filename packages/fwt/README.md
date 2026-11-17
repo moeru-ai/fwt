@@ -116,6 +116,11 @@ fwt follows the `XDG_*_HOME` variables. It writes `config.toml` and `auth.json` 
 
 ```toml
 provider = "gateway"
+shell = [
+  "srt",
+  "--settings",
+  "/home/me/.config/fwt/srt.json"
+]
 
 [providers.gateway]
 name = "My gateway"
@@ -132,6 +137,8 @@ effort = "high"
 image = false
 ```
 
+`shell` is the program that runs each command, with its arguments. fwt adds `-c <command>` after them. The default is `["/bin/bash"]`, or `["/bin/sh"]` when bash is missing. Model requests and session files do not go through `shell`.
+
 A provider has one base URL for each protocol it serves. Values under `models.<model>` have priority over models.dev. fwt picks the protocol from `--protocol`, then the model's `protocol`, then models.dev, then the first base URL.
 
 ### Context and compaction
@@ -146,7 +153,7 @@ fwt retries network errors, status 429, and status 500 and higher up to four tim
 
 | Tool | Use |
 | --- | --- |
-| `exec_command` | Runs a shell command with `bash -c`. `stdin` is written and then closed. |
+| `exec_command` | Runs a shell command with `shell` from `config.toml`. `stdin` is written and then closed. |
 | `write_stdin` | Writes to a running command, or reads its new output. |
 | `view_image` | Reads a PNG, JPEG, GIF, or WebP file. Only for models that accept images. |
 

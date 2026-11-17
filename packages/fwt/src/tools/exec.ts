@@ -37,7 +37,7 @@ interface ExecCommandInput {
 
 interface ExecManagerOptions {
   defaultCwd?: string
-  shell?: string
+  shell?: readonly [string, ...string[]]
 }
 
 interface ExecOutput {
@@ -251,7 +251,7 @@ const formatExecOutput = (
 
 export const createExecManager = (options: ExecManagerOptions = {}): ExecManager => {
   const defaultCwd = options.defaultCwd ?? process.cwd()
-  const shell = options.shell ?? (existsSync('/bin/bash') ? '/bin/bash' : '/bin/sh')
+  const [shell, ...shellArgs] = options.shell ?? [existsSync('/bin/bash') ? '/bin/bash' : '/bin/sh']
   const sessions = new Map<number, ExecSession>()
   let nextId = 1
 
@@ -294,7 +294,7 @@ export const createExecManager = (options: ExecManagerOptions = {}): ExecManager
     const startedAt = Date.now()
     const id = nextId++
 
-    const child = spawn(shell, ['-c', input.cmd], {
+    const child = spawn(shell, [...shellArgs, '-c', input.cmd], {
       cwd,
       detached: true,
       env: {
