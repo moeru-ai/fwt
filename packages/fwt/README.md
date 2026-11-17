@@ -253,7 +253,7 @@ fwt takes the context window from `--context-length`, from `FWT_CONTEXT_LENGTH`,
 
 The output limit for one step is the lowest of three values: the `max_output` of the model, 32,768 tokens, and a quarter of the context window. fwt sends the output limit to the API only with the `messages` protocol, because the Anthropic Messages API requires it.
 
-fwt keeps the output limit free in the context window. When the input of a step reaches 85% of the rest, fwt tells the model to finish its work. When the input reaches the rest, the run stops with exit code 3.
+fwt keeps the output limit free in the context window. When the input of a step reaches the rest of the window, the run stops with exit code 3.
 
 ### Retries
 

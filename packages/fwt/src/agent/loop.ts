@@ -48,8 +48,6 @@ const readAgentsInstructions = async (cwd: string, home?: string): Promise<strin
 }
 
 const MAX_LOOP_REPEATS = 3
-const CONTEXT_WARNING_RATIO = 0.85
-const CONTEXT_WINDOW_REMINDER = `<context_window_reminder>You have used ${CONTEXT_WARNING_RATIO * 100}% of the context window. Finish essential verification and deliver a clear final answer rather than starting broad new exploration.</context_window_reminder>`
 
 export type AgentEvent
   = | { call: ToolCallPart, type: 'tool.call' }
@@ -246,22 +244,7 @@ export const runAgent = async (options: RunAgentOptions): Promise<AgentRunResult
     ? { messages: { cacheControl: { type: 'ephemeral' } } }
     : undefined
 
-  let pendingContextReminder = false
-  let reminderMessageIndex: number | undefined
-  let appendReminderToNextFlush = false
   let stopReason: AgentStopReason = 'completed'
-
-  const applyContextReminder = (messages: readonly Message[]): readonly Message[] => {
-    if (reminderMessageIndex == null)
-      return messages
-    const target = messages[reminderMessageIndex]
-    if (target == null || target.role !== 'user' || typeof target.content === 'string')
-      return messages
-    return messages.with(reminderMessageIndex, {
-      ...target,
-      content: [...target.content, { text: CONTEXT_WINDOW_REMINDER, type: 'text' }],
-    })
-  }
 
   const stopWhen: StopCondition = ({ step, steps }) => {
     if (step.usage != null && step.usage.inputTokens >= inputBudget) {
@@ -283,14 +266,6 @@ export const runAgent = async (options: RunAgentOptions): Promise<AgentRunResult
       return true
     }
 
-    if (
-      reminderMessageIndex == null
-      && step.usage != null
-      && step.usage.inputTokens >= Math.floor(inputBudget * CONTEXT_WARNING_RATIO)
-    ) {
-      pendingContextReminder = true
-    }
-
     return false
   }
 
@@ -299,29 +274,17 @@ export const runAgent = async (options: RunAgentOptions): Promise<AgentRunResult
     instructions: STATIC_SYSTEM_PROMPT,
     maxOutputTokens: options.model.protocol === 'messages' ? options.model.maxOutputTokens : undefined,
     prepareStep: ({ input }) => {
-      if (pendingContextReminder && reminderMessageIndex == null) {
-        const lastIndex = input.length - 1
-        const lastMessage = input[lastIndex]
-        if (lastMessage.role === 'user' && typeof lastMessage.content !== 'string') {
-          reminderMessageIndex = lastIndex
-          pendingContextReminder = false
-          appendReminderToNextFlush = true
-        }
-      }
-
-      const effectiveInput = applyContextReminder(input)
-
       if (options.model.protocol === 'chat')
-        return { input: splitChatToolResultImages(effectiveInput) }
+        return { input: splitChatToolResultImages(input) }
 
       if (options.model.protocol === 'messages') {
         return {
-          input: applyMessagesCacheBreakpoints(effectiveInput),
+          input: applyMessagesCacheBreakpoints(input),
           instructions: undefined,
         }
       }
 
-      return reminderMessageIndex != null ? { input: [...effectiveInput] } : undefined
+      return undefined
     },
     preToolCall: options.preToolCall,
     providerOptions,
@@ -340,11 +303,7 @@ export const runAgent = async (options: RunAgentOptions): Promise<AgentRunResult
   const flushToolResults = async (): Promise<void> => {
     if (pendingToolResults.length === 0)
       return
-    const content: (TextPart | ToolResultPart)[] = appendReminderToNextFlush
-      ? [...pendingToolResults, { text: CONTEXT_WINDOW_REMINDER, type: 'text' }]
-      : pendingToolResults
-    appendReminderToNextFlush = false
-    const batchMessage: Message = { content, role: 'user' }
+    const batchMessage: Message = { content: pendingToolResults, role: 'user' }
     pendingToolResults = []
     conversation.push(batchMessage)
     if (options.sessionStore != null)

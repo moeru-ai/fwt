@@ -13,7 +13,7 @@ import { join } from 'node:path'
 import { sleep } from '@moeru/std'
 import { afterEach, describe, expect, it } from 'vitest'
 
-import { discoverSkills, runAgent, STATIC_SYSTEM_PROMPT } from '../src/agent'
+import { discoverSkills, runAgent } from '../src/agent'
 import { resolveModel } from '../src/providers'
 import { createSessionStore, openSessionStore } from '../src/session'
 
@@ -459,105 +459,6 @@ describe('runAgent multi-protocol integration', () => {
     await sleep(20)
   })
 
-  it('injects a one-time soft context_window_reminder at 85% maxContextTokens while preserving prefix immutability', async () => {
-    const dir = await makeTempDir()
-    const server = await startServer((_body, idx, res) => {
-      if (idx === 0) {
-        writeSse(res, [
-          {
-            choices: [{
-              delta: {
-                role: 'assistant',
-                tool_calls: [{
-                  function: { arguments: '{"cmd":"echo step1"}', name: 'exec_command' },
-                  id: 'call_1',
-                  index: 0,
-                  type: 'function',
-                }],
-              },
-              finish_reason: null,
-              index: 0,
-            }],
-          },
-          {
-            choices: [{ delta: {}, finish_reason: 'tool_calls', index: 0 }],
-            usage: { completion_tokens: 10, prompt_tokens: 850, total_tokens: 860 },
-          },
-        ], ['data: [DONE]\n\n'])
-        return
-      }
-      if (idx === 1) {
-        writeSse(res, [
-          {
-            choices: [{
-              delta: {
-                role: 'assistant',
-                tool_calls: [{
-                  function: { arguments: '{"cmd":"echo step2"}', name: 'exec_command' },
-                  id: 'call_2',
-                  index: 0,
-                  type: 'function',
-                }],
-              },
-              finish_reason: null,
-              index: 0,
-            }],
-          },
-          {
-            choices: [{ delta: {}, finish_reason: 'tool_calls', index: 0 }],
-            usage: { completion_tokens: 10, prompt_tokens: 900, total_tokens: 910 },
-          },
-        ], ['data: [DONE]\n\n'])
-        return
-      }
-      writeSse(res, [
-        { choices: [{ delta: { content: 'wrapped-up', role: 'assistant' }, finish_reason: null, index: 0 }] },
-        {
-          choices: [{ delta: {}, finish_reason: 'stop', index: 0 }],
-          usage: { completion_tokens: 8, prompt_tokens: 920, total_tokens: 928 },
-        },
-      ], ['data: [DONE]\n\n'])
-    })
-
-    const store = await createSessionStore({
-      cwd: dir,
-      id: 'ctx-reminder',
-      model: 'deepseek-chat',
-      protocol: 'chat',
-      provider: 'deepseek',
-      sessionsDir: dir,
-    })
-
-    const model = resolveModel({
-      apiKey: 'k',
-      baseURL: server.baseURL,
-      model: 'deepseek-chat',
-      protocol: 'chat',
-    })
-
-    const result = await runAgent({
-      cwd: dir,
-      model: { ...model, contextTokens: 1100, maxOutputTokens: 100 },
-      prompt: 'finish cleanly',
-      sessionStore: store,
-      skills: [],
-    })
-
-    expect(result.stopReason).toBe('completed')
-    expect(result.text).toBe('wrapped-up')
-    expect(STATIC_SYSTEM_PROMPT).toContain('rg --files')
-
-    const req1Msgs = server.requests[1].messages as unknown[]
-    const req2Msgs = server.requests[2].messages as unknown[]
-    expect(JSON.stringify(req2Msgs.slice(0, req1Msgs.length))).toBe(JSON.stringify(req1Msgs))
-
-    const req2Json = JSON.stringify(req2Msgs)
-    expect(req2Json.match(/<context_window_reminder>/g)).toHaveLength(1)
-
-    const reopened = await openSessionStore('ctx-reminder', dir)
-    expect(JSON.stringify(reopened.messages()).match(/<context_window_reminder>/g)).toHaveLength(1)
-  })
-
   it('discloses visible skills on turn 0, activates explicit /skill and $skill references, and deduplicates across resume', async () => {
     const root = await makeTempDir()
     const userSkillsDir = join(root, 'user-skills')
@@ -633,34 +534,27 @@ describe('runAgent multi-protocol integration', () => {
 
   it('applies model.contextTokens and model.supportsImageInput automatically in runAgent', async () => {
     const dir = await makeTempDir()
-    const server = await startServer((_body, idx, res) => {
-      if (idx === 0) {
-        writeSse(res, [
-          {
-            choices: [{
-              delta: {
-                role: 'assistant',
-                tool_calls: [{
-                  function: { arguments: '{"cmd":"echo hi"}', name: 'exec_command' },
-                  id: 'call_meta_1',
-                  index: 0,
-                  type: 'function',
-                }],
-              },
-              finish_reason: null,
-              index: 0,
-            }],
-          },
-          {
-            choices: [{ delta: {}, finish_reason: 'tool_calls', index: 0 }],
-            usage: { completion_tokens: 10, prompt_tokens: 850, total_tokens: 860 },
-          },
-        ], ['data: [DONE]\n\n'])
-        return
-      }
+    const server = await startServer((_body, _idx, res) => {
       writeSse(res, [
-        { choices: [{ delta: { content: 'meta-done', role: 'assistant' }, finish_reason: null, index: 0 }] },
-        { choices: [{ delta: {}, finish_reason: 'stop', index: 0 }] },
+        {
+          choices: [{
+            delta: {
+              role: 'assistant',
+              tool_calls: [{
+                function: { arguments: '{"cmd":"echo hi"}', name: 'exec_command' },
+                id: 'call_meta_1',
+                index: 0,
+                type: 'function',
+              }],
+            },
+            finish_reason: null,
+            index: 0,
+          }],
+        },
+        {
+          choices: [{ delta: {}, finish_reason: 'tool_calls', index: 0 }],
+          usage: { completion_tokens: 10, prompt_tokens: 1000, total_tokens: 1010 },
+        },
       ], ['data: [DONE]\n\n'])
     })
 
@@ -679,9 +573,9 @@ describe('runAgent multi-protocol integration', () => {
       skills: [],
     })
 
-    expect(result.text).toBe('meta-done')
+    expect(result.stopReason).toBe('context_limit')
+    expect(server.requests).toHaveLength(1)
     const sentTools = (server.requests[0].tools as { function: { name: string } }[]).map(t => t.function.name)
     expect(sentTools).toEqual(['exec_command', 'write_stdin'])
-    expect(JSON.stringify(server.requests[1].messages)).toContain('<context_window_reminder>')
   })
 })
