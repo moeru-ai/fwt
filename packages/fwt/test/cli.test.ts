@@ -159,6 +159,8 @@ describe('fwt CLI', () => {
     const forkRequest = server.requests[2].messages as unknown[]
     expect(JSON.stringify(forkRequest.slice(0, sourceLastRequest.length)))
       .toBe(JSON.stringify(sourceLastRequest))
+    expect(JSON.stringify(forkRequest.at(-1))).toContain(`cwd: ${otherCwd}`)
+    expect(JSON.stringify(forkRequest.at(-1))).toContain(`forked from a session in ${dir}`)
     expect(fork.sessionId).not.toBe(source.sessionId)
     expect(server.headers[0]['x-session']).toBe(source.sessionId)
     expect(server.headers[2]['x-session']).toBe(fork.sessionId)

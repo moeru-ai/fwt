@@ -103,6 +103,8 @@ export const createFwtCli = (options: CreateFwtCliOptions = {}): Cli => {
   const sessionsDir = join(fwtDirs(options.home).state, 'sessions')
   const resolveCwd = (io: CliIo, cwd: string | undefined): string => resolve(io.cwd ?? process.cwd(), cwd ?? '')
   const getRunSession = async (flags: Parameters<typeof buildModelInput>[0] & { cwd?: string, fork?: string, resume?: string }, io: CliIo) => {
+    if (flags.resume != null && flags.resume !== '' && flags.fork != null && flags.fork !== '')
+      throw new UsageError('--resume and --fork cannot be used together.')
     const runCwd = resolveCwd(io, flags.cwd)
     const sessionRef = flags.resume != null && flags.resume !== '' ? flags.resume : flags.fork
     const source = sessionRef == null || sessionRef === '' ? undefined : await openSessionStore(sessionRef, sessionsDir, runCwd)
@@ -132,7 +134,7 @@ export const createFwtCli = (options: CreateFwtCliOptions = {}): Cli => {
       sessionStore = source
     }
 
-    return { model, sessionStore }
+    return { model, previousCwd: source?.header.cwd, sessionStore }
   }
   const runAcp = async ({ flags, io, signal }: CommandContext<typeof modelFlags>): Promise<void> => startAcpServer({
     input: io.stdin ?? process.stdin,
@@ -203,8 +205,6 @@ export const createFwtCli = (options: CreateFwtCliOptions = {}): Cli => {
         return runAcp(context)
       if (flags.permissionMode === 'ask')
         throw new UsageError('--permission-mode ask needs an ACP client; use it with `fwt acp`.')
-      if (flags.resume != null && flags.resume !== '' && flags.fork != null && flags.fork !== '')
-        throw new UsageError('--resume and --fork cannot be used together.')
 
       let prompt = flags.prompt ?? args.prompt
       if ((prompt == null || prompt.trim() === '') && io.stdin != null && io.stdin.isTTY !== true)
@@ -213,13 +213,16 @@ export const createFwtCli = (options: CreateFwtCliOptions = {}): Cli => {
       if (prompt == null || prompt.trim() === '')
         throw new UsageError('Provide a prompt with -p/--prompt, positional text, or stdin.')
 
-      const { model: resolvedModel, sessionStore } = await getRunSession(flags, io)
+      const { model: resolvedModel, previousCwd, sessionStore } = await getRunSession(flags, io)
+      const cwd = sessionStore.header.cwd
+      if (previousCwd != null && previousCwd !== cwd)
+        prompt = `<environment_context>\ncwd: ${cwd}\n</environment_context>\n\nThis session was forked from a session in ${previousCwd}. Earlier messages refer to files under ${previousCwd}; use the same relative paths under ${cwd}, and do not change files under ${previousCwd}.\n\n${prompt}`
 
       const outputFormat = flags.output ?? 'text'
       let streamedText = false
 
       const result = await runAgent({
-        cwd: sessionStore.header.cwd,
+        cwd,
         home: options.home,
         maxTurns: flags.maxTurns,
         model: resolvedModel,
