@@ -43,7 +43,7 @@ fwt -p "Describe these screenshots" -i before.png -i after.png
 
 fwt works in the current directory, or in `--cwd <path>`. Piped input goes into the prompt inside a `<stdin>` block. fwt reads it until it ends, so a program that starts fwt must close standard input or redirect it from `/dev/null`.
 
-With `-o jsonl`, fwt writes one JSON object for each event. The last line has the type `result`, with `sessionId`, `stopReason`, `stopReasonDetail`, `steps`, `text`, and `cacheStats`. The exit code tells you why the run stopped:
+With `-o jsonl`, fwt writes one JSON object for each event. A `compaction` event reports a context summary as it starts and ends. The last line has the type `result`, with `sessionId`, `stopReason`, `stopReasonDetail`, `steps`, `text`, and `cacheStats`. The exit code tells you why the run stopped:
 
 | Exit code | `stopReason` | Meaning |
 | --- | --- | --- |
@@ -69,6 +69,12 @@ Both accept a session ID, a session file path, or `latest`, which is the newest 
 `fwt acp` serves the [Agent Client Protocol](https://agentclientprotocol.com) over standard input and output. It supports version 1 and version 2 (`2.0.0-alpha.15`); the client picks one in `initialize`. Prompts can hold text, images, resources, and resource links.
 
 In `auto` mode, which is the default, fwt runs each tool call. In `ask` mode (`--permission-mode ask`), it asks the client with `session/request_permission` first.
+
+Each session has three config options: `mode`, `model`, and `effort`. A `model` value is `<provider>/<model>`, and the list holds the models of each provider in `config.toml` and on models.dev. A new model or effort applies from the next prompt. The session file keeps the model it started with, so a resumed session starts with that model again.
+
+When no provider is set up, `session/new` fails with error `-32000`. The sign-in method in `initialize` tells the client to run `fwt provider add` in a terminal.
+
+During a prompt, fwt reports token use in `usage_update` and each context summary in `compaction_update`.
 
 ## Reference
 

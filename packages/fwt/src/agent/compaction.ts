@@ -2,8 +2,10 @@ import type { Content, LanguageModel, LanguageModelProviderOptions, Message, Too
 
 import type { ResolvedModelConfig } from '../providers'
 import type { SessionCompactionRecord, SessionStore } from '../session'
+import type { AgentEvent } from './loop'
 
 import { Buffer } from 'node:buffer'
+import { randomUUID } from 'node:crypto'
 
 import { collect } from '@xsai/text'
 
@@ -129,6 +131,7 @@ const summaryFailure = (generated: Awaited<ReturnType<typeof collect>>, summary:
 interface CompactionOptions {
   languageModel: LanguageModel
   model: ResolvedModelConfig
+  onEvent?: (event: AgentEvent) => void
   providerOptions: LanguageModelProviderOptions | undefined
   signal: AbortSignal | undefined
   stepNumber: number
@@ -163,6 +166,32 @@ const summarize = async (
   return { failure, summary, usage }
 }
 
+const adoptSummary = async (
+  options: CompactionOptions,
+  context: { active: Message[], currentTokens: number, inputBudget: number, margin: number },
+): Promise<{ error: string } | { summary: string }> => {
+  const { model, store } = options
+  const tailStartMessage = selectTailStart(store.messages(), context.inputBudget)
+  const instruction = summaryInstruction(tailStartMessage, context.inputBudget, store.filePath)
+  const request = toWireRequest(context.active, model.protocol, store.compaction() != null)
+  let failure: string | undefined
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const content = failure == null ? instruction : `${instruction}\n\nCorrection: the previous summary failed because ${failure}. Return a corrected summary with every required section.`
+    const needed = context.currentTokens + estimateMessages([{ content, role: 'user' }]) + model.maxOutputTokens + context.margin
+    if (needed > model.contextTokens)
+      return { error: `The summary request needs about ${needed} tokens, beyond the ${model.contextTokens}-token context window.` }
+    const result = await summarize(options, request, content, tailStartMessage)
+    failure = result.failure
+    if (failure == null && result.usage != null) {
+      await store.appendCompaction({ summary: result.summary, tailStartMessage, usage: result.usage })
+      return { summary: result.summary }
+    }
+    if (result.usage != null)
+      await store.appendUsage({ model: model.model, stepNumber: options.stepNumber, usage: result.usage })
+  }
+  return { error: `The summary could not be adopted after one correction: ${failure}.` }
+}
+
 export const compactIfNeeded = async (options: CompactionOptions): Promise<string | undefined> => {
   const { model, store } = options
   const { inputBudget, margin } = contextBudget(model)
@@ -178,23 +207,16 @@ export const compactIfNeeded = async (options: CompactionOptions): Promise<strin
   if (currentTokens <= Math.floor(0.8 * inputBudget))
     return undefined
 
-  const tailStartMessage = selectTailStart(messages, inputBudget)
-  const instruction = summaryInstruction(tailStartMessage, inputBudget, store.filePath)
-  const request = toWireRequest(active, model.protocol, store.compaction() != null)
-  let failure: string | undefined
-  for (let attempt = 0; attempt < 2; attempt += 1) {
-    const content = failure == null ? instruction : `${instruction}\n\nCorrection: the previous summary failed because ${failure}. Return a corrected summary with every required section.`
-    const needed = currentTokens + estimateMessages([{ content, role: 'user' }]) + model.maxOutputTokens + margin
-    if (needed > model.contextTokens)
-      return `The summary request needs about ${needed} tokens, beyond the ${model.contextTokens}-token context window.`
-    const result = await summarize(options, request, content, tailStartMessage)
-    failure = result.failure
-    if (failure == null && result.usage != null) {
-      await store.appendCompaction({ summary: result.summary, tailStartMessage, usage: result.usage })
-      return undefined
-    }
-    if (result.usage != null)
-      await store.appendUsage({ model: model.model, stepNumber: options.stepNumber, usage: result.usage })
+  const compactionId = randomUUID()
+  options.onEvent?.({ compactionId, status: 'in_progress', type: 'compaction' })
+  let outcome: Awaited<ReturnType<typeof adoptSummary>>
+  try {
+    outcome = await adoptSummary(options, { active, currentTokens, inputBudget, margin })
   }
-  return `The summary could not be adopted after one correction: ${failure}.`
+  catch (error) {
+    options.onEvent?.({ compactionId, error: error instanceof Error ? error.message : String(error), status: options.signal?.aborted === true ? 'cancelled' : 'failed', type: 'compaction' })
+    throw error
+  }
+  options.onEvent?.({ compactionId, ...outcome, status: 'error' in outcome ? 'failed' : 'completed', type: 'compaction' })
+  return 'error' in outcome ? outcome.error : undefined
 }

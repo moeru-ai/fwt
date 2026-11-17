@@ -23,6 +23,7 @@ const MAX_LOOP_REPEATS = 3
 
 export type AgentEvent
   = | { call: ToolCallPart, type: 'tool.call' }
+    | { compactionId: string, error?: string, status: 'cancelled' | 'completed' | 'failed' | 'in_progress', summary?: string, type: 'compaction' }
     | { delta: string, type: 'reasoning.delta' }
     | { delta: string, type: 'text.delta' }
     | { miss: CacheMissEvent, type: 'cache.miss' }
@@ -175,7 +176,7 @@ export const runAgent = async (options: RunAgentOptions): Promise<AgentRunResult
     maxOutputTokens: model.protocol === 'messages' ? model.maxOutputTokens : undefined,
     prepareStep: async () => {
       await flushToolResults()
-      const reason = await compactIfNeeded({ languageModel, model, providerOptions, signal: options.signal, stepNumber, store, tools })
+      const reason = await compactIfNeeded({ languageModel, model, onEvent: options.onEvent, providerOptions, signal: options.signal, stepNumber, store, tools })
       if (reason != null) {
         stop('context_limit', reason)
         throw new Error(`context_limit: ${reason}`)

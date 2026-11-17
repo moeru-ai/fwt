@@ -3,7 +3,7 @@ import type { Message, PreToolCall, ToolCallPart, ToolResultPart } from '@xsai/t
 import type { AgentStopReason } from '../agent'
 import type { ModelConfigInput, ResolvedModelConfig } from '../providers'
 import type { SessionStore } from '../session'
-import type { AcpProtocolVersion, PermissionMode, PermissionOutcome } from './protocol'
+import type { AcpProtocolVersion, ModelGroup, PermissionMode, PermissionOutcome } from './protocol'
 
 import process from 'node:process'
 
@@ -15,11 +15,14 @@ import * as v from 'valibot'
 
 import { version } from '../../package.json' with { type: 'json' }
 import { buildActiveMessages, runAgent } from '../agent'
-import { resolveModel, resolveRecordedModel } from '../providers'
+import { fwtDirs } from '../home'
+import { readCachedCatalog, readConfig, resolveModel, resolveRecordedModel } from '../providers'
 import { createSessionStore, listSessionHeaders, openSessionStore } from '../session'
 import {
   createAgentEventMapper,
-  formatModeConfigOption,
+  DEFAULT_EFFORT,
+  formatAuthMethods,
+  formatConfigOptions,
   formatModes,
   initializeParamsSchema,
   jsonRpcEnvelopeSchema,
@@ -81,6 +84,7 @@ interface AcpServerOptions {
 
 interface AcpSessionState {
   activeController?: AbortController
+  effort?: string
   model: ResolvedModelConfig
   permissionMode: PermissionMode
   store: SessionStore
@@ -191,22 +195,59 @@ const handleInitialize = (runtime: AcpRuntime, params: unknown): Record<string, 
         sessionCapabilities: { resume: {} },
       },
       agentInfo: { name: 'fwt', version },
-      authMethods: [],
+      authMethods: formatAuthMethods(1),
       protocolVersion: 1,
     }
   }
 
   return {
-    authMethods: [],
+    authMethods: formatAuthMethods(2),
     capabilities: { session: { prompt: { embeddedContext: {}, image: {} } } },
     info: { name: 'fwt', version },
     protocolVersion: 2,
   }
 }
 
+const requireModel = (resolveConfig: () => ResolvedModelConfig): ResolvedModelConfig => {
+  try {
+    return resolveConfig()
+  }
+  catch (error) {
+    throw Object.assign(new RpcError(-32000, error instanceof Error ? error.message : 'Authentication required'), { cause: error })
+  }
+}
+
+const listModelGroups = (runtime: AcpRuntime, current: ResolvedModelConfig): ModelGroup[] => {
+  const dirs = fwtDirs(runtime.modelConfig?.home)
+  const catalog = readCachedCatalog(dirs)
+  const groups = Object.entries(readConfig(dirs).providers).map(([id, provider]): ModelGroup => {
+    const catalogModels = catalog?.[id]?.models ?? {}
+    const models = new Set([provider.model, ...Object.keys(provider.models ?? {}), ...Object.keys(catalogModels)])
+    return {
+      groupId: id,
+      name: provider.name ?? catalog?.[id]?.name ?? id,
+      options: [...models].filter(model => model != null).map(model => ({ name: catalogModels[model]?.name ?? model, value: `${id}/${model}` })),
+    }
+  })
+  const value = `${current.provider}/${current.model}`
+  const group = groups.find(entry => entry.groupId === current.provider)
+  if (group == null)
+    groups.unshift({ groupId: current.provider, name: current.provider, options: [{ name: current.model, value }] })
+  else if (!group.options.some(option => option.value === value))
+    group.options.unshift({ name: current.model, value })
+  return groups
+}
+
+const sessionConfigOptions = (runtime: AcpRuntime, session: AcpSessionState): Record<string, unknown>[] =>
+  formatConfigOptions(
+    runtime.protocolVersion,
+    { effort: session.effort ?? DEFAULT_EFFORT, mode: session.permissionMode, model: `${session.model.provider}/${session.model.model}` },
+    listModelGroups(runtime, session.model),
+  )
+
 const handleSessionNew = async (runtime: AcpRuntime, params: unknown): Promise<Record<string, unknown>> => {
   const parsed = parseParams(sessionNewParamsSchema, params)
-  const model = resolveModel(runtime.modelConfig)
+  const model = requireModel(() => resolveModel(runtime.modelConfig))
   const mode = runtime.defaultPermissionMode
 
   const store = await createSessionStore({
@@ -217,16 +258,13 @@ const handleSessionNew = async (runtime: AcpRuntime, params: unknown): Promise<R
     sessionsDir: runtime.sessionsDir,
   })
 
-  runtime.sessions.set(store.id, {
-    model,
-    permissionMode: mode,
-    store,
-    toolPolicy: new Map(),
-  })
+  const session: AcpSessionState = { model, permissionMode: mode, store, toolPolicy: new Map() }
+  runtime.sessions.set(store.id, session)
 
+  const configOptions = sessionConfigOptions(runtime, session)
   return runtime.protocolVersion === 1
-    ? { modes: formatModes(mode), sessionId: store.id }
-    : { configOptions: [formatModeConfigOption(mode)], sessionId: store.id }
+    ? { configOptions, modes: formatModes(mode), sessionId: store.id }
+    : { configOptions, sessionId: store.id }
 }
 
 const sessionNotFound = (sessionId: string, cause?: unknown): RpcError =>
@@ -239,7 +277,7 @@ const ensureSession = async (runtime: AcpRuntime, sessionId: string): Promise<Ac
   let session = runtime.sessions.get(store.id)
   if (session == null) {
     session = {
-      model: resolveRecordedModel(runtime.modelConfig ?? {}, store.header),
+      model: requireModel(() => resolveRecordedModel(runtime.modelConfig ?? {}, store.header)),
       permissionMode: runtime.defaultPermissionMode,
       store,
       toolPolicy: new Map(),
@@ -299,7 +337,7 @@ const handleSessionLoad = async (runtime: AcpRuntime, params: unknown): Promise<
   const session = await ensureSession(runtime, parsed.sessionId)
   assertSessionCwd(session, parsed.cwd)
   replayHistory(runtime, session.store)
-  return { modes: formatModes(session.permissionMode), sessionId: session.store.id }
+  return { configOptions: sessionConfigOptions(runtime, session), modes: formatModes(session.permissionMode), sessionId: session.store.id }
 }
 
 const handleSessionResume = async (runtime: AcpRuntime, params: unknown): Promise<Record<string, unknown>> => {
@@ -310,7 +348,7 @@ const handleSessionResume = async (runtime: AcpRuntime, params: unknown): Promis
   assertSessionCwd(session, parsed.cwd)
 
   if (runtime.protocolVersion === 1)
-    return { modes: formatModes(session.permissionMode), sessionId: session.store.id }
+    return { configOptions: sessionConfigOptions(runtime, session), modes: formatModes(session.permissionMode), sessionId: session.store.id }
 
   if ('replayFrom' in parsed && parsed.replayFrom != null) {
     replayHistory(runtime, session.store)
@@ -318,7 +356,7 @@ const handleSessionResume = async (runtime: AcpRuntime, params: unknown): Promis
     runtime.sendNotification(note.method, note.params)
   }
   runtime.sendSessionState(session.store.id, session.activeController == null ? 'idle' : 'running')
-  return { configOptions: [formatModeConfigOption(session.permissionMode)] }
+  return { configOptions: sessionConfigOptions(runtime, session) }
 }
 
 const handleSessionList = async (runtime: AcpRuntime, params: unknown): Promise<Record<string, unknown>> => {
@@ -354,8 +392,25 @@ const handleSessionSetMode = (runtime: AcpRuntime, params: unknown): Record<stri
 const handleSessionSetConfigOption = (runtime: AcpRuntime, params: unknown): Record<string, unknown> => {
   const parsed = parseParams(sessionSetConfigOptionParamsSchema, params)
   const session = findSession(runtime, parsed.sessionId)
-  session.permissionMode = parsed.value
-  return { configOptions: [formatModeConfigOption(parsed.value)] }
+  switch (parsed.configId) {
+    case 'effort':
+      session.effort = parsed.value === DEFAULT_EFFORT ? undefined : parsed.value
+      break
+    case 'mode':
+      session.permissionMode = parsed.value
+      break
+    case 'model': {
+      const slash = parsed.value.indexOf('/')
+      const { effort, fetch, headers, home } = runtime.modelConfig ?? {}
+      try {
+        session.model = resolveModel({ effort, fetch, headers, home, model: parsed.value.slice(slash + 1), provider: parsed.value.slice(0, slash) })
+      }
+      catch (error) {
+        throw Object.assign(new RpcError(-32602, error instanceof Error ? error.message : 'Invalid model'), { cause: error })
+      }
+    }
+  }
+  return { configOptions: sessionConfigOptions(runtime, session) }
 }
 
 const cancelSession = (runtime: AcpRuntime, sessionId: string): void => {
@@ -430,7 +485,8 @@ const handleSessionPrompt = async (runtime: AcpRuntime, params: unknown): Promis
     : controller.signal
   session.activeController = controller
 
-  const mapEvent = createAgentEventMapper(runtime.protocolVersion, session.store.id)
+  const model = session.effort == null ? session.model : { ...session.model, effort: session.effort }
+  const mapEvent = createAgentEventMapper(runtime.protocolVersion, session.store.id, model.contextTokens)
   const run = async (onPromptInserted?: () => void): Promise<Awaited<ReturnType<typeof runAgent>>> => {
     try {
       return await runAgent({
@@ -438,7 +494,7 @@ const handleSessionPrompt = async (runtime: AcpRuntime, params: unknown): Promis
         home: runtime.modelConfig?.home,
         images,
         maxTurns: runtime.maxTurns,
-        model: session.model,
+        model,
         onEvent: (event) => {
           const note = mapEvent(event)
           if (note != null)
@@ -482,7 +538,7 @@ const handleSessionPrompt = async (runtime: AcpRuntime, params: unknown): Promis
 }
 
 const v1Only = new Set(['session/load', 'session/set_mode'])
-const v2Only = new Set(['session/close', 'session/list', 'session/set_config_option'])
+const v2Only = new Set(['session/close', 'session/list'])
 
 const dispatchMethod = async (runtime: AcpRuntime, method: string, params: unknown): Promise<unknown> => {
   if (method !== 'initialize' && (runtime.protocolVersion === 1 ? v2Only : v1Only).has(method))

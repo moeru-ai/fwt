@@ -1,8 +1,10 @@
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import type { AddressInfo } from 'node:net'
 
+import type { ModelConfigInput } from '../src/providers'
+
 import { Buffer } from 'node:buffer'
-import { mkdtemp, rm } from 'node:fs/promises'
+import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { createServer } from 'node:http'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -71,6 +73,7 @@ const createMockChatServer = async (
 const createAcpHarness = (options: {
   baseURL: string
   cwd: string
+  modelConfig?: ModelConfigInput
   sessionsDir: string
 }): AcpHarness => {
   const clientToServer = new PassThrough()
@@ -109,7 +112,7 @@ const createAcpHarness = (options: {
 
   const serverDone = startAcpServer({
     input: clientToServer,
-    modelConfig: {
+    modelConfig: options.modelConfig ?? {
       apiKey: 'test-key',
       baseURL: options.baseURL,
       home: options.cwd,
@@ -199,12 +202,14 @@ describe('aCP v1 and v2 dual-version server', () => {
 
     const init = await acp.request('initialize', { protocolVersion: 1 })
     expect(init.protocolVersion).toBe(1)
+    expect(init.authMethods).toEqual([expect.objectContaining({ args: ['provider', 'add'], id: 'provider-add', type: 'terminal' })])
     expect(init.agentCapabilities).toMatchObject({ loadSession: true, sessionCapabilities: { resume: {} } })
     await expect(acp.request('session/resume', { cwd: dir, sessionId: 'missing' })).rejects.toThrow('-32002')
 
     const created = await acp.request('session/new', { cwd: dir })
     const sessionId = created.sessionId as string
     expect(sessionId).toBeTypeOf('string')
+    expect(created.configOptions).toMatchObject([{ id: 'mode' }, { category: 'model', currentValue: 'custom/mock-model', id: 'model' }, { category: 'thought_level', currentValue: 'default', id: 'effort' }])
 
     const promptRes = await acp.request('session/prompt', {
       prompt: [{ text: 'run echo', type: 'text' }],
@@ -220,6 +225,67 @@ describe('aCP v1 and v2 dual-version server', () => {
     expect(updateKinds).toContain('tool_call')
     expect(updateKinds).toContain('tool_call_update')
     expect(updateKinds).toContain('agent_message_chunk')
+    const updates = acp.notifications.map(n => n.params?.update as Record<string, unknown>)
+    expect(updates).toContainEqual(expect.objectContaining({ sessionUpdate: 'tool_call', title: 'echo acp-v1', toolCallId: 'call_v1' }))
+    expect(updates).toContainEqual(expect.objectContaining({
+      content: [{ content: { text: expect.stringContaining('acp-v1') as unknown, type: 'text' }, type: 'content' }],
+      sessionUpdate: 'tool_call_update',
+      status: 'completed',
+    }))
+  })
+
+  it('asks for sign-in when no provider is configured', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'fwt-acp-auth-'))
+    cleanups.push(async () => rm(dir, { force: true, recursive: true }))
+
+    const acp = createAcpHarness({ baseURL: '', cwd: dir, modelConfig: { home: dir }, sessionsDir: dir })
+    cleanups.push(acp.close)
+
+    const init = await acp.request('initialize', { info: { name: 'test', version: '0' }, protocolVersion: 2 })
+    expect(init.authMethods).toEqual([expect.objectContaining({ args: ['provider', 'add'], methodId: 'provider-add', type: 'terminal' })])
+    await expect(acp.request('session/new', { cwd: dir })).rejects.toThrow('-32000')
+  })
+
+  it('switches model and reasoning effort between prompts', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'fwt-acp-model-'))
+    cleanups.push(async () => rm(dir, { force: true, recursive: true }))
+
+    const httpServer = await createMockChatServer((_body, _idx, res) => {
+      writeSse(res, [
+        { choices: [{ delta: { content: 'ok', role: 'assistant' }, finish_reason: null, index: 0 }] },
+        { choices: [{ delta: {}, finish_reason: 'stop', index: 0 }], usage: { completion_tokens: 5, prompt_tokens: 100, total_tokens: 105 } },
+      ])
+    })
+    cleanups.push(httpServer.close)
+    await writeFile(join(dir, 'config.toml'), `[providers.mock]\nbase_url = { chat = "${httpServer.baseURL}" }\nmodel = "other-model"\n\n[providers.mock.models.other-model]\ncontext = 64000\n`)
+
+    const acp = createAcpHarness({ baseURL: httpServer.baseURL, cwd: dir, sessionsDir: dir })
+    cleanups.push(acp.close)
+
+    await acp.request('initialize', { info: { name: 'test', version: '0' }, protocolVersion: 2 })
+    const created = await acp.request('session/new', { cwd: dir })
+    const sessionId = created.sessionId as string
+    expect((created.configOptions as Record<string, unknown>[])[1]).toMatchObject({
+      configId: 'model',
+      currentValue: 'custom/mock-model',
+      options: [
+        { groupId: 'custom', options: [{ value: 'custom/mock-model' }] },
+        { groupId: 'mock', options: [{ value: 'mock/other-model' }] },
+      ],
+    })
+
+    await expect(acp.request('session/set_config_option', { configId: 'model', sessionId, type: 'id', value: 'missing/model' })).rejects.toThrow('-32602')
+    const switched = await acp.request('session/set_config_option', { configId: 'model', sessionId, type: 'id', value: 'mock/other-model' })
+    expect(switched.configOptions).toMatchObject([{ configId: 'mode' }, { configId: 'model', currentValue: 'mock/other-model' }, { configId: 'effort' }])
+    const effort = await acp.request('session/set_config_option', { configId: 'effort', sessionId, type: 'id', value: 'high' })
+    expect(effort.configOptions).toMatchObject([{}, {}, { configId: 'effort', currentValue: 'high' }])
+
+    await acp.request('session/prompt', { prompt: [{ text: 'hi', type: 'text' }], sessionId })
+    await vi.waitFor(() => {
+      expect(acp.notifications.at(-1)?.params?.update).toMatchObject({ state: 'idle', stopReason: 'end_turn' })
+    })
+    expect(httpServer.requests[0]).toMatchObject({ model: 'other-model', reasoning_effort: 'high' })
+    expect(acp.notifications.map(n => n.params?.update)).toContainEqual({ sessionUpdate: 'usage_update', size: 64000, used: 105 })
   })
 
   it('negotiates protocolVersion 2, reports state_update, supports ask permissions via config options, cancels, and resumes with replay', async () => {
@@ -270,10 +336,10 @@ describe('aCP v1 and v2 dual-version server', () => {
 
     const created = await acp.request('session/new', { cwd: dir })
     const sessionId = created.sessionId as string
-    expect(created.configOptions).toMatchObject([{ configId: 'mode', currentValue: 'auto', type: 'select' }])
+    expect((created.configOptions as unknown[])[0]).toMatchObject({ configId: 'mode', currentValue: 'auto', type: 'select' })
     await expect(acp.request('session/set_mode', { modeId: 'ask', sessionId })).rejects.toThrow('-32601')
     const configured = await acp.request('session/set_config_option', { configId: 'mode', sessionId, type: 'id', value: 'ask' })
-    expect(configured.configOptions).toMatchObject([{ configId: 'mode', currentValue: 'ask' }])
+    expect((configured.configOptions as unknown[])[0]).toMatchObject({ configId: 'mode', currentValue: 'ask' })
 
     const permissionRequests: JsonRpcMessage[] = []
     acp.onRequest((msg) => {
@@ -429,13 +495,23 @@ describe('aCP v1 and v2 dual-version server', () => {
   })
 
   it('starts a new agent message id for each model step', () => {
-    const map = createAgentEventMapper(2, 's1')
+    const map = createAgentEventMapper(2, 's1', 1000)
     const idOf = (note: ReturnType<typeof map>): unknown => (note as NonNullable<typeof note>).params.update
     const messageIdOf = (note: ReturnType<typeof map>): unknown => (idOf(note) as { messageId: string }).messageId
     const first = messageIdOf(map({ delta: 'a', type: 'text.delta' }))
     expect(messageIdOf(map({ delta: 'b', type: 'text.delta' }))).toBe(first)
     map({ stepNumber: 2, type: 'step.start' })
     expect(messageIdOf(map({ delta: 'c', type: 'text.delta' }))).not.toBe(first)
+  })
+
+  it('maps compaction progress to compaction_update', () => {
+    const map = createAgentEventMapper(2, 's1', 1000)
+    expect(map({ compactionId: 'c1', status: 'in_progress', type: 'compaction' })?.params.update)
+      .toEqual({ compactionId: 'c1', sessionUpdate: 'compaction_update', status: 'in_progress' })
+    expect(map({ compactionId: 'c1', status: 'completed', summary: 'done', type: 'compaction' })?.params.update)
+      .toEqual({ compactionId: 'c1', sessionUpdate: 'compaction_update', status: 'completed', summary: [{ text: 'done', type: 'text' }] })
+    expect(map({ compactionId: 'c2', error: 'boom', status: 'failed', type: 'compaction' })?.params.update)
+      .toEqual({ compactionId: 'c2', error: 'boom', sessionUpdate: 'compaction_update', status: 'failed' })
   })
 })
 

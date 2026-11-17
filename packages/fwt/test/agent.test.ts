@@ -1011,8 +1011,13 @@ describe('runAgent multi-protocol integration', () => {
     await store.appendMessage({ content: 'initial request', role: 'user' })
     await store.appendMessage({ content: 'old work '.repeat(23_000), role: 'assistant' })
 
-    const result = await runAgent({ cwd: dir, maxTurns: 10, model, prompt: 'continue', sessionStore: store, skills: [] })
+    const events: AgentEvent[] = []
+    const result = await runAgent({ cwd: dir, maxTurns: 10, model, onEvent: event => events.push(event), prompt: 'continue', sessionStore: store, skills: [] })
 
+    expect(events.filter(event => event.type === 'compaction')).toEqual([
+      { compactionId: expect.any(String) as unknown, status: 'in_progress', type: 'compaction' },
+      { compactionId: expect.any(String) as unknown, status: 'completed', summary, type: 'compaction' },
+    ])
     expect(execSessionId).toMatch(/^\d+$/)
     expect(result.stopReason).toBe('loop_detected')
     expect(result.steps).toBe(4)

@@ -52,12 +52,18 @@ export const sessionResumeParamsSchema = v.object({
   sessionId: v.string(),
 })
 
-export const sessionSetConfigOptionParamsSchema = v.object({
-  configId: v.literal('mode'),
+const setConfigOption = <TId extends string, TValue extends v.GenericSchema<unknown, string>>(configId: TId, value: TValue) => v.object({
+  configId: v.literal(configId),
   sessionId: v.string(),
-  type: v.literal('id'),
-  value: permissionModeSchema,
+  type: v.optional(v.literal('id')),
+  value,
 })
+
+export const sessionSetConfigOptionParamsSchema = v.variant('configId', [
+  setConfigOption('mode', permissionModeSchema),
+  setConfigOption('model', v.pipe(v.string(), v.regex(/^[^/]+\/./, 'Expected "provider/model"'))),
+  setConfigOption('effort', v.pipe(v.string(), v.nonEmpty())),
+])
 
 export const sessionSetModeParamsSchema = v.object({
   modeId: permissionModeSchema,
@@ -188,6 +194,16 @@ export const mapStopReason = (reason: AgentStopReason): string => {
   }
 }
 
+const PROVIDER_ADD = {
+  args: ['provider', 'add'],
+  description: 'Choose a model provider, enter its API key, and select a model.',
+  name: 'Add a provider',
+  type: 'terminal',
+}
+
+export const formatAuthMethods = (version: AcpProtocolVersion): Record<string, unknown>[] =>
+  [version === 1 ? { id: 'provider-add', ...PROVIDER_ADD } : { methodId: 'provider-add', ...PROVIDER_ADD }]
+
 const MODES = [
   { description: 'Run tools locally without confirmation prompts.', id: 'auto', name: 'Auto' },
   { description: 'Request permission before running each tool.', id: 'ask', name: 'Ask' },
@@ -208,22 +224,67 @@ export const sessionUpdate = (sessionId: string, update: Record<string, unknown>
   params: { sessionId, update },
 })
 
-export const formatModeConfigOption = (currentValue: PermissionMode): Record<string, unknown> => ({
-  category: 'mode',
-  configId: 'mode',
-  currentValue,
-  name: 'Mode',
-  options: MODES.map(({ description, id, name }) => ({ description, name, value: id })),
-  type: 'select',
-})
+export const DEFAULT_EFFORT = 'default'
 
-export const toolCallFields = (call: ToolCallPart, version: AcpProtocolVersion): Record<string, unknown> => ({
-  kind: toolKind(call.name),
-  ...version === 2 && { name: call.name },
-  rawInput: safeJsonParse(call.arguments),
-  title: call.name,
-  toolCallId: call.callId,
-})
+const EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max']
+
+export interface ModelGroup {
+  groupId: string
+  name: string
+  options: { name: string, value: string }[]
+}
+
+export const formatConfigOptions = (
+  version: AcpProtocolVersion,
+  current: { effort: string, mode: PermissionMode, model: string },
+  models: readonly ModelGroup[],
+): Record<string, unknown>[] => {
+  const option = (configId: string, fields: Record<string, unknown>): Record<string, unknown> =>
+    ({ ...version === 1 ? { id: configId } : { configId }, type: 'select', ...fields })
+  const efforts = EFFORTS.includes(current.effort) || current.effort === DEFAULT_EFFORT ? EFFORTS : [...EFFORTS, current.effort]
+  return [
+    option('mode', {
+      category: 'mode',
+      currentValue: current.mode,
+      name: 'Mode',
+      options: MODES.map(({ description, id, name }) => ({ description, name, value: id })),
+    }),
+    option('model', { category: 'model', currentValue: current.model, name: 'Model', options: models }),
+    option('effort', {
+      category: 'thought_level',
+      currentValue: current.effort,
+      name: 'Reasoning effort',
+      options: [
+        { description: 'Use the effort set in config.toml or by the command line.', name: 'Default', value: DEFAULT_EFFORT },
+        ...efforts.map(effort => ({ name: effort, value: effort })),
+      ],
+    }),
+  ]
+}
+
+const toolTitle = (name: string, input: unknown): string => {
+  if (typeof input !== 'object' || input == null)
+    return name
+  const { chars, cmd, path, session_id: process } = input as Record<string, unknown>
+  if (name === 'exec_command' && typeof cmd === 'string')
+    return cmd
+  if (name === 'view_image' && typeof path === 'string')
+    return `View ${path}`
+  if (name === 'write_stdin' && typeof process === 'number')
+    return typeof chars === 'string' && chars !== '' ? `Write to process ${process}` : `Wait for process ${process}`
+  return name
+}
+
+export const toolCallFields = (call: ToolCallPart, version: AcpProtocolVersion): Record<string, unknown> => {
+  const rawInput = safeJsonParse(call.arguments)
+  return {
+    kind: toolKind(call.name),
+    ...version === 2 && { name: call.name },
+    rawInput,
+    title: toolTitle(call.name, rawInput),
+    toolCallId: call.callId,
+  }
+}
 
 export const toolCallUpdate = (call: ToolCallPart, version: AcpProtocolVersion): Record<string, unknown> => ({
   ...toolCallFields(call, version),
@@ -231,8 +292,16 @@ export const toolCallUpdate = (call: ToolCallPart, version: AcpProtocolVersion):
   status: 'in_progress',
 })
 
+const toolResultContent = (output: ToolResultPart['output']): Record<string, unknown>[] =>
+  (typeof output === 'string' ? [{ text: output, type: 'text' as const }] : output).flatMap((part): Record<string, unknown>[] => {
+    if (part.type === 'text')
+      return [{ content: { text: part.text, type: 'text' }, type: 'content' }]
+    const match = /^data:([^;]+);base64,(.*)$/s.exec(String(part.data))
+    return match == null ? [] : [{ content: { data: match[2], mimeType: match[1], type: 'image' }, type: 'content' }]
+  })
+
 export const toolResultUpdate = (result: ToolResultPart): Record<string, unknown> => ({
-  rawOutput: result.output,
+  content: toolResultContent(result.output),
   sessionUpdate: 'tool_call_update',
   status: result.isError === true ? 'failed' : 'completed',
   toolCallId: result.callId,
@@ -241,6 +310,7 @@ export const toolResultUpdate = (result: ToolResultPart): Record<string, unknown
 export const createAgentEventMapper = (
   version: AcpProtocolVersion,
   sessionId: string,
+  contextTokens: number,
 ): ((event: AgentEvent) => AcpNotification | undefined) => {
   let messageId = randomUUID()
   let thoughtId = randomUUID()
@@ -249,10 +319,21 @@ export const createAgentEventMapper = (
   return (event) => {
     switch (event.type) {
       case 'cache.miss':
-      case 'step.end':
         return undefined
+      case 'compaction':
+        return sessionUpdate(sessionId, {
+          compactionId: event.compactionId,
+          sessionUpdate: 'compaction_update',
+          status: event.status,
+          ...event.error != null && { error: event.error },
+          ...event.summary != null && { summary: [{ text: event.summary, type: 'text' }] },
+        })
       case 'reasoning.delta':
         return chunk('agent_thought_chunk', event.delta, thoughtId)
+      case 'step.end':
+        return event.usage == null
+          ? undefined
+          : sessionUpdate(sessionId, { sessionUpdate: 'usage_update', size: contextTokens, used: event.usage.inputTokens + event.usage.outputTokens })
       case 'step.start':
         messageId = randomUUID()
         thoughtId = randomUUID()
