@@ -18,7 +18,6 @@ const CACHE_MISS_NOISE_FLOOR_TOKENS = 1024
 export interface CacheStats {
   record: (usage: Usage, stepNumber: number) => CacheMissEvent | undefined
   recordCompaction: (usage: Usage) => void
-  resetExpected: () => void
   snapshot: () => CacheStatsSnapshot
 }
 
@@ -33,18 +32,10 @@ export interface CacheStatsSnapshot {
   totalOutputTokens: number
 }
 
-export interface SessionCompactionRecord {
-  summary: string
-  tailStartMessage: number
-  timestamp: string
-  type: 'compaction'
-  usage: Usage
-}
-
 export interface SessionStore {
   appendCompaction: (record: Omit<SessionCompactionRecord, 'timestamp' | 'type'>) => Promise<void>
   appendMessage: (message: Message) => Promise<void>
-  appendUsage: (record: Omit<SessionUsageRecord, 'timestamp' | 'type'>) => Promise<void>
+  appendUsage: (record: Omit<SessionUsageRecord, 'cacheMiss' | 'timestamp' | 'type'>) => Promise<CacheMissEvent | undefined>
   cacheStats: CacheStats
   compaction: () => SessionCompactionRecord | undefined
   filePath: string
@@ -53,7 +44,7 @@ export interface SessionStore {
   id: string
   messages: () => readonly Message[]
   records: () => readonly (SessionCompactionRecord | SessionMessageRecord)[]
-  usageBaseline: () => undefined | { inputTokens: number, messageCount: number }
+  usageBaseline: () => undefined | UsageBaseline
 }
 
 interface CreateSessionStoreOptions {
@@ -65,21 +56,9 @@ interface CreateSessionStoreOptions {
   sessionsDir: string
 }
 
-interface SessionMessageRecord {
-  message: Message
-  timestamp: string
-  type: 'message'
-}
-
-type SessionRecord = SessionCompactionRecord | SessionHeader | SessionMessageRecord | SessionUsageRecord
-
-interface SessionUsageRecord {
-  cacheMiss?: CacheMissEvent
-  model?: string
-  stepNumber: number
-  timestamp: string
-  type: 'usage'
-  usage: Usage
+interface UsageBaseline {
+  inputTokens: number
+  messageCount: number
 }
 
 const cacheMissSchema = v.object({
@@ -87,6 +66,15 @@ const cacheMissSchema = v.object({
   expectedCachedTokens: v.number(),
   missedTokens: v.number(),
   stepNumber: v.number(),
+})
+
+const usageSchema = v.object({
+  cacheCreationInputTokens: v.optional(v.number()),
+  cacheReadInputTokens: v.optional(v.number()),
+  inputTokens: v.number(),
+  outputTokens: v.number(),
+  reasoningTokens: v.optional(v.number()),
+  totalTokens: v.number(),
 })
 
 const safeParseJson = (line: string): unknown => {
@@ -108,10 +96,6 @@ const sessionHeaderSchema = v.object({
   type: v.literal('session'),
 })
 
-export type CacheMissEvent = v.InferOutput<typeof cacheMissSchema>
-
-export type SessionHeader = v.InferOutput<typeof sessionHeaderSchema>
-
 const sessionMessageSchema = v.object({
   message: v.looseObject({
     content: v.union([v.string(), v.array(v.unknown())]),
@@ -127,14 +111,7 @@ const sessionUsageSchema = v.object({
   stepNumber: v.number(),
   timestamp: v.string(),
   type: v.literal('usage'),
-  usage: v.looseObject({
-    cacheCreationInputTokens: v.optional(v.number()),
-    cacheReadInputTokens: v.optional(v.number()),
-    inputTokens: v.number(),
-    outputTokens: v.number(),
-    reasoningTokens: v.optional(v.number()),
-    totalTokens: v.number(),
-  }),
+  usage: usageSchema,
 })
 
 const sessionCompactionSchema = v.object({
@@ -142,14 +119,7 @@ const sessionCompactionSchema = v.object({
   tailStartMessage: v.pipe(v.number(), v.integer(), v.minValue(0)),
   timestamp: v.string(),
   type: v.literal('compaction'),
-  usage: v.looseObject({
-    cacheCreationInputTokens: v.optional(v.number()),
-    cacheReadInputTokens: v.optional(v.number()),
-    inputTokens: v.number(),
-    outputTokens: v.number(),
-    reasoningTokens: v.optional(v.number()),
-    totalTokens: v.number(),
-  }),
+  usage: usageSchema,
 })
 
 const sessionRecordSchema = v.variant('type', [
@@ -159,10 +129,17 @@ const sessionRecordSchema = v.variant('type', [
   sessionUsageSchema,
 ])
 
-const hasPreviousAssistantMessage = (records: readonly (SessionCompactionRecord | SessionMessageRecord)[]): boolean => {
-  const previousRecord = records.at(-1)
-  return previousRecord?.type === 'message' && previousRecord.message.role === 'assistant'
-}
+export type CacheMissEvent = v.InferOutput<typeof cacheMissSchema>
+
+export type SessionCompactionRecord = v.InferOutput<typeof sessionCompactionSchema>
+
+export type SessionHeader = v.InferOutput<typeof sessionHeaderSchema>
+
+type SessionMessageRecord = Omit<v.InferOutput<typeof sessionMessageSchema>, 'message'> & { message: Message }
+
+type SessionRecord = SessionCompactionRecord | SessionHeader | SessionMessageRecord | SessionUsageRecord
+
+type SessionUsageRecord = v.InferOutput<typeof sessionUsageSchema>
 
 export const createCacheStats = (): CacheStats => {
   let lastInputTokens = 0
@@ -173,31 +150,30 @@ export const createCacheStats = (): CacheStats => {
   let steps = 0
   const misses: CacheMissEvent[] = []
 
-  const record = (usage: Usage, stepNumber: number): CacheMissEvent | undefined => {
-    const cacheRead = usage.cacheReadInputTokens ?? 0
-    const cacheCreate = usage.cacheCreationInputTokens ?? 0
+  const add = (usage: Usage): void => {
     totalInputTokens += usage.inputTokens
     totalOutputTokens += usage.outputTokens
-    totalCacheReadTokens += cacheRead
-    totalCacheCreationTokens += cacheCreate
+    totalCacheReadTokens += usage.cacheReadInputTokens ?? 0
+    totalCacheCreationTokens += usage.cacheCreationInputTokens ?? 0
     steps += 1
+  }
 
-    let miss: CacheMissEvent | undefined
-    if (lastInputTokens > CACHE_MISS_NOISE_FLOOR_TOKENS) {
-      const missedTokens = Math.max(0, lastInputTokens - cacheRead)
-      if (missedTokens > CACHE_MISS_NOISE_FLOOR_TOKENS) {
-        miss = {
-          actualCacheReadTokens: cacheRead,
-          expectedCachedTokens: lastInputTokens,
-          missedTokens,
-          stepNumber,
-        }
-        misses.push(miss)
-      }
-    }
-
+  const record = (usage: Usage, stepNumber: number): CacheMissEvent | undefined => {
+    add(usage)
+    const cacheRead = usage.cacheReadInputTokens ?? 0
+    const missedTokens = Math.max(0, lastInputTokens - cacheRead)
+    const miss = lastInputTokens > CACHE_MISS_NOISE_FLOOR_TOKENS && missedTokens > CACHE_MISS_NOISE_FLOOR_TOKENS
+      ? { actualCacheReadTokens: cacheRead, expectedCachedTokens: lastInputTokens, missedTokens, stepNumber }
+      : undefined
+    if (miss != null)
+      misses.push(miss)
     lastInputTokens = usage.inputTokens
     return miss
+  }
+
+  const recordCompaction = (usage: Usage): void => {
+    add(usage)
+    lastInputTokens = 0
   }
 
   const snapshot = (): CacheStatsSnapshot => ({
@@ -211,90 +187,73 @@ export const createCacheStats = (): CacheStats => {
     totalOutputTokens,
   })
 
-  const recordCompaction = (usage: Usage): void => {
-    totalInputTokens += usage.inputTokens
-    totalOutputTokens += usage.outputTokens
-    totalCacheReadTokens += usage.cacheReadInputTokens ?? 0
-    totalCacheCreationTokens += usage.cacheCreationInputTokens ?? 0
-    steps += 1
-  }
-
-  const resetExpected = (): void => {
-    lastInputTokens = 0
-  }
-
-  return { record, recordCompaction, resetExpected, snapshot }
+  return { record, recordCompaction, snapshot }
 }
 
-const buildSessionStore = (
-  header: SessionHeader,
-  filePath: string,
-  initialMessages: Message[],
-  initialRecords: (SessionCompactionRecord | SessionMessageRecord)[],
-  initialCompaction: SessionCompactionRecord | undefined,
-  initialUsageBaseline: undefined | { inputTokens: number, messageCount: number },
-  cacheStats: CacheStats,
-): SessionStore => {
-  const storedMessages = [...initialMessages]
-  const storedRecords = [...initialRecords]
-  let lastCompaction = initialCompaction
-  let lastUsageBaseline = initialUsageBaseline
+const buildSessionStore = (header: SessionHeader, filePath: string): SessionStore & { apply: (record: SessionRecord) => CacheMissEvent | undefined } => {
+  const cacheStats = createCacheStats()
+  const messages: Message[] = []
+  const records: (SessionCompactionRecord | SessionMessageRecord)[] = []
+  let compaction: SessionCompactionRecord | undefined
+  let usageBaseline: undefined | UsageBaseline
   let writeQueue = Promise.resolve()
 
-  const enqueueLine = async (record: SessionRecord): Promise<void> => {
-    const line = `${JSON.stringify(record)}\n`
-    const next = writeQueue.then(async () => appendFile(filePath, line, 'utf8'))
+  const apply = (record: SessionRecord): CacheMissEvent | undefined => {
+    switch (record.type) {
+      case 'compaction':
+        records.push(record)
+        compaction = record
+        usageBaseline = undefined
+        cacheStats.recordCompaction(record.usage)
+        return undefined
+      case 'message':
+        records.push(record)
+        messages.push(record.message)
+        return undefined
+      case 'session':
+        return undefined
+      case 'usage': {
+        const previous = records.at(-1)
+        const repliedTo = previous?.type === 'message' && previous.message.role === 'assistant'
+        usageBaseline = { inputTokens: record.usage.inputTokens, messageCount: messages.length - (repliedTo ? 1 : 0) }
+        return cacheStats.record(record.usage, record.stepNumber)
+      }
+    }
+  }
+
+  const write = async (record: SessionRecord): Promise<void> => {
+    const next = writeQueue.then(async () => appendFile(filePath, `${JSON.stringify(record)}\n`, 'utf8'))
     writeQueue = next.catch(() => {})
     await next
   }
 
-  const appendMessage = async (message: Message): Promise<void> => {
-    const record: SessionMessageRecord = {
-      message,
-      timestamp: new Date().toISOString(),
-      type: 'message',
-    }
-    await enqueueLine(record)
-    storedMessages.push(message)
-    storedRecords.push(record)
-  }
-
-  const appendCompaction = async (entry: Omit<SessionCompactionRecord, 'timestamp' | 'type'>): Promise<void> => {
-    const record: SessionCompactionRecord = { ...entry, timestamp: new Date().toISOString(), type: 'compaction' }
-    await enqueueLine(record)
-    lastCompaction = record
-    lastUsageBaseline = undefined
-    storedRecords.push(record)
-    cacheStats.recordCompaction(record.usage)
-    cacheStats.resetExpected()
-  }
-
-  const appendUsage = async (entry: Omit<SessionUsageRecord, 'timestamp' | 'type'>): Promise<void> => {
-    await enqueueLine({
-      ...entry,
-      timestamp: new Date().toISOString(),
-      type: 'usage',
-    })
-    const previousRecord = storedRecords.at(-1)
-    if (previousRecord?.type === 'message' && previousRecord.message.role === 'assistant')
-      lastUsageBaseline = { inputTokens: entry.usage.inputTokens, messageCount: storedMessages.length - 1 }
-  }
-
-  const flush = async (): Promise<void> => writeQueue
-
   return {
-    appendCompaction,
-    appendMessage,
-    appendUsage,
+    appendCompaction: async (entry) => {
+      const record: SessionCompactionRecord = { ...entry, timestamp: new Date().toISOString(), type: 'compaction' }
+      await write(record)
+      apply(record)
+    },
+    appendMessage: async (message) => {
+      const record: SessionMessageRecord = { message, timestamp: new Date().toISOString(), type: 'message' }
+      await write(record)
+      apply(record)
+    },
+    appendUsage: async (entry) => {
+      const record: SessionUsageRecord = { ...entry, timestamp: new Date().toISOString(), type: 'usage' }
+      const cacheMiss = apply(record)
+      await write(cacheMiss == null ? record : { ...record, cacheMiss })
+      return cacheMiss
+    },
+    apply,
     cacheStats,
-    compaction: () => lastCompaction,
+    compaction: () => compaction,
     filePath,
-    flush,
+    flush: async () => writeQueue,
     header,
     id: header.id,
-    messages: () => storedMessages,
-    records: () => storedRecords,
-    usageBaseline: () => lastUsageBaseline,
+    messages: () => messages,
+    records: () => records,
+    usageBaseline: () => usageBaseline,
   }
 }
 
@@ -316,7 +275,7 @@ export const createSessionStore = async (options: CreateSessionStoreOptions): Pr
   await mkdir(dirname(filePath), { recursive: true })
   await appendFile(filePath, `${JSON.stringify(header)}\n`, 'utf8')
 
-  return buildSessionStore(header, filePath, [], [], undefined, undefined, createCacheStats())
+  return buildSessionStore(header, filePath)
 }
 
 export const forkSessionStore = async (
@@ -404,14 +363,7 @@ export const openSessionStore = async (idOrPath: string, sessionsDir: string, la
     lines.pop()
   const completeLines = lines.filter(line => line.trim() !== '')
 
-  let header: SessionHeader | undefined
-  const messages: Message[] = []
-  const records: (SessionCompactionRecord | SessionMessageRecord)[] = []
-  let lastCompaction: SessionCompactionRecord | undefined
-  let lastUsageBaseline: undefined | { inputTokens: number, messageCount: number }
-  const cacheStats = createCacheStats()
-
-  for (const [index, line] of completeLines.entries()) {
+  const parsed = completeLines.map((line, index) => {
     let parsedJson: unknown
     try {
       parsedJson = JSON.parse(line)
@@ -419,42 +371,18 @@ export const openSessionStore = async (idOrPath: string, sessionsDir: string, la
     catch (error) {
       throw new Error(`Invalid JSON on line ${index + 1} of session "${filePath}".`, { cause: error })
     }
-
     const result = v.safeParse(sessionRecordSchema, parsedJson)
     if (!result.success)
       throw new Error(`Invalid session record on line ${index + 1} of session "${filePath}".`)
+    return result.output as SessionRecord
+  })
 
-    const record = result.output
-    switch (record.type) {
-      case 'compaction':
-        lastCompaction = record
-        lastUsageBaseline = undefined
-        records.push(record)
-        cacheStats.recordCompaction(record.usage)
-        cacheStats.resetExpected()
-        break
-      case 'message':
-        messages.push(record.message as Message)
-        records.push({ ...record, message: record.message as Message })
-        break
-      case 'session':
-        header = record
-        break
-      case 'usage': {
-        if (hasPreviousAssistantMessage(records)) {
-          cacheStats.record(record.usage, record.stepNumber)
-          lastUsageBaseline = { inputTokens: record.usage.inputTokens, messageCount: messages.length - 1 }
-        }
-        else {
-          cacheStats.recordCompaction(record.usage)
-        }
-        break
-      }
-    }
-  }
-
+  const header = parsed.find(record => record.type === 'session')
   if (header == null)
     throw new Error(`Session file "${filePath}" is missing its session header record.`)
 
-  return buildSessionStore(header, filePath, messages, records, lastCompaction, lastUsageBaseline, cacheStats)
+  const store = buildSessionStore(header, filePath)
+  for (const record of parsed)
+    store.apply(record)
+  return store
 }

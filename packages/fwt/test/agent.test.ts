@@ -76,6 +76,9 @@ const createMockServer = async (handler: SseScriptHandler): Promise<MockServer> 
 
 const PNG_BYTES = Uint8Array.from([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00])
 
+const storeFor = async (dir: string): Promise<Awaited<ReturnType<typeof createSessionStore>>> =>
+  createSessionStore({ cwd: dir, model: 'mock-model', protocol: 'chat', provider: 'mock', sessionsDir: dir })
+
 describe('runAgent multi-protocol integration', () => {
   const cleanups: (() => Promise<void>)[] = []
 
@@ -218,6 +221,7 @@ describe('runAgent multi-protocol integration', () => {
       cwd: dir,
       model,
       prompt: 'say hello',
+      sessionStore: await storeFor(dir),
       skills: [],
     })
 
@@ -469,6 +473,7 @@ describe('runAgent multi-protocol integration', () => {
       maxTurns: 10,
       model,
       prompt: 'loop test',
+      sessionStore: await storeFor(dir),
       skills: [],
     })
 
@@ -498,6 +503,7 @@ describe('runAgent multi-protocol integration', () => {
         cwd: dir,
         model,
         prompt: 'hang',
+        sessionStore: await storeFor(dir),
         signal: controller.signal,
         skills: [],
       })).rejects.toThrow('user aborted')
@@ -620,6 +626,7 @@ describe('runAgent multi-protocol integration', () => {
       cwd: dir,
       model: resolveModel({ apiKey: 'k', home: dir, model: 'text-only', provider: 'local' }),
       prompt: 'check metadata',
+      sessionStore: await storeFor(dir),
       skills: [],
     })
 
@@ -767,7 +774,7 @@ describe('runAgent multi-protocol integration', () => {
     expect(store.records().some(record => record.type === 'compaction')).toBe(false)
     const reopened = await openSessionStore('failed-compaction', dir)
     expect(reopened.cacheStats.snapshot().totalInputTokens).toBe(2000)
-    expect(reopened.usageBaseline()).toBeUndefined()
+    expect(reopened.usageBaseline()).toEqual({ inputTokens: 1000, messageCount: 3 })
   })
 
   it('does not retry or commit a cancelled summary request', async () => {
@@ -911,6 +918,49 @@ describe('runAgent multi-protocol integration', () => {
       expect(combined.content.at(-1)).toMatchObject({ cache_control: { type: 'ephemeral' } })
       expect(combined.content.at(-1)?.text).toContain('Historical work state summary')
     }
+  })
+
+  it('moves tool result images out of chat summary requests', async () => {
+    const dir = await makeTempDir()
+    const summary = [
+      'Goal and unfinished requirements',
+      'User corrections and active constraints',
+      'Current state and changed files',
+      'Decisions and rejected approaches',
+      'Checks run, results, and remaining verification',
+      'Running commands and exact identifiers',
+      'Next action and open questions',
+      'References to recover omitted details',
+    ].join('\n')
+    const server = await startServer((body, _idx, res) => {
+      const text = JSON.stringify(body.messages).includes('Write a continuation summary') ? summary : 'done'
+      writeSse(res, [
+        { choices: [{ delta: { content: text, role: 'assistant' }, finish_reason: null, index: 0 }] },
+        { choices: [{ delta: {}, finish_reason: 'stop', index: 0 }], usage: { completion_tokens: 10, prompt_tokens: 32000, total_tokens: 32010 } },
+      ], ['data: [DONE]\n\n'])
+    })
+    await writeFile(join(dir, 'config.toml'), [
+      '[providers.local]',
+      `base_url = { chat = "${server.baseURL}" }`,
+      '[providers.local.models.compact-model]',
+      'context = 40000',
+      'max_output = 100',
+    ].join('\n'))
+    const model = resolveModel({ apiKey: 'test-key', home: dir, model: 'compact-model', provider: 'local' })
+    const store = await createSessionStore({ cwd: dir, id: 'image-compaction', model: 'compact-model', protocol: 'chat', provider: 'local', sessionsDir: dir })
+    await store.appendMessage({ content: 'look at the screenshot', role: 'user' })
+    await store.appendMessage({ content: [{ arguments: '{"path":"shot.png"}', callId: 'view-1', id: 'view-1', name: 'view_image', type: 'tool-call' }], role: 'assistant' })
+    await store.appendMessage({ content: [{ callId: 'view-1', output: [{ data: 'data:image/png;base64,iVBORw0KGgo=', type: 'image' }], type: 'tool-result' }], role: 'user' })
+    await store.appendMessage({ content: 'z'.repeat(80_000), role: 'assistant' })
+    await store.appendMessage({ content: 'more', role: 'user' })
+    await store.appendMessage({ content: 'ok', role: 'assistant' })
+    await store.appendUsage({ model: 'compact-model', stepNumber: 0, usage: { inputTokens: 31_500, outputTokens: 1, totalTokens: 31_501 } })
+
+    const result = await runAgent({ cwd: dir, model, prompt: 'continue', sessionStore: store, skills: [] })
+
+    expect(result.stopReason).toBe('completed')
+    expect(JSON.stringify(server.requests[0])).toContain('Write a continuation summary')
+    expect(JSON.stringify(server.requests[0])).toContain('image_url')
   })
 
   it('keeps exec sessions, step counts, and loop detection across compaction', async () => {

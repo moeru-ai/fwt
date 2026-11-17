@@ -67,7 +67,6 @@ describe('sessionStore JSONL persistence', () => {
       ],
       role: 'assistant',
     })
-    store.cacheStats.record({ inputTokens: 2000, outputTokens: 100, totalTokens: 2100 }, 0)
     await store.appendUsage({
       model: 'deepseek-chat',
       stepNumber: 0,
