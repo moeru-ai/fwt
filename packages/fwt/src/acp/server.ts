@@ -14,7 +14,7 @@ import { createInterface } from 'node:readline'
 import * as v from 'valibot'
 
 import { version } from '../../package.json' with { type: 'json' }
-import { runAgent } from '../agent'
+import { buildActiveMessages, runAgent } from '../agent'
 import { resolveModel, resolveRecordedModel } from '../providers'
 import { createSessionStore, listSessionHeaders, openSessionStore } from '../session'
 import {
@@ -295,7 +295,7 @@ const replayHistory = (runtime: AcpRuntime, store: SessionStore): void => {
     const note = sessionUpdate(store.id, update)
     runtime.sendNotification(note.method, note.params)
   }
-  for (const [index, message] of store.messages().entries()) {
+  for (const [index, message] of buildActiveMessages(store.messages(), store.compaction()).entries()) {
     if (runtime.protocolVersion === 1)
       replayMessageV1(message, send)
     else

@@ -52,7 +52,7 @@ The last line of the output is a JSON object of type `result`. Its `text` field 
 | Exit code | Meaning | What you do |
 | --- | --- | --- |
 | 0 | The agent gave its final answer. | Read `text`. |
-| 3 | The conversation filled the context window. | Read `text`, and then start a new run with a smaller task. |
+| 3 | fwt could not compact the context enough to continue. | Read `stopReasonDetail` in JSON Lines output or the `context_limit` message on standard error. Keep the session and reduce the task or provide a larger context window. |
 | 4 | The agent made the same tool calls three times in a row. | Continue the session with a hint, or start a new run with a clearer prompt. |
 | 5 | The run reached `--max-turns`. | Continue the session if the work is worth more steps. |
 | 130 | The run was stopped. | Tell the user. |

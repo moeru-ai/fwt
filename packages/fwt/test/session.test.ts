@@ -57,6 +57,7 @@ describe('sessionStore JSONL persistence', () => {
       provider: 'deepseek',
       sessionsDir: dir,
     })
+    expect(JSON.parse((await readFile(store.filePath, 'utf8')).split('\n')[0])).not.toHaveProperty('version')
 
     await store.appendMessage({ content: 'hello', role: 'user' })
     await store.appendMessage({
@@ -78,6 +79,7 @@ describe('sessionStore JSONL persistence', () => {
     expect(reopened.id).toBe('session-alpha')
     expect(reopened.messages()).toEqual(store.messages())
     expect(reopened.cacheStats.snapshot().lastInputTokens).toBe(2000)
+    expect(reopened.usageBaseline()).toEqual({ inputTokens: 2000, messageCount: 1 })
 
     const latest = await openSessionStore('latest', dir, dir)
     expect(latest.filePath).toBe(store.filePath)
@@ -136,6 +138,40 @@ describe('sessionStore JSONL persistence', () => {
     expect(fork.cacheStats.snapshot().steps).toBe(0)
     expect(await readFile(source.filePath, 'utf8')).toBe(sourceBytes)
     expect((await openSessionStore(fork.id, dir)).messages()).toEqual(source.messages())
+  })
+
+  it('copies compaction records in message order and ignores an incomplete final line', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'fwt-compaction-fork-'))
+    tempDirs.push(dir)
+    const source = await createSessionStore({
+      cwd: dir,
+      id: 'compaction-source',
+      model: 'deepseek-chat',
+      protocol: 'chat',
+      provider: 'deepseek',
+      sessionsDir: dir,
+    })
+    const usage = { inputTokens: 400, outputTokens: 20, totalTokens: 420 }
+    await source.appendMessage({ content: 'initial', role: 'user' })
+    await source.appendMessage({ content: 'old answer', role: 'assistant' })
+    await source.appendCompaction({ summary: 'work summary', tailStartMessage: 1, usage })
+    await source.appendMessage({ content: 'recent', role: 'user' })
+
+    const fork = await forkSessionStore(source, { sessionsDir: dir })
+    const reopened = await openSessionStore(fork.id, dir)
+    expect(reopened.messages()).toEqual(source.messages())
+    expect(reopened.compaction()).toMatchObject({ summary: 'work summary', tailStartMessage: 1, usage })
+    expect(reopened.records().map(record => record.type)).toEqual(['message', 'message', 'compaction', 'message'])
+    expect(reopened.cacheStats.snapshot().totalInputTokens).toBe(usage.inputTokens)
+
+    await writeFile(fork.filePath, '{"type":"message"', { flag: 'a' })
+    const afterIncomplete = await openSessionStore(fork.id, dir)
+    expect(afterIncomplete.messages()).toEqual(source.messages())
+    expect(afterIncomplete.compaction()?.summary).toBe('work summary')
+
+    const noFinalNewlinePath = join(dir, 'complete-without-newline.jsonl')
+    await writeFile(noFinalNewlinePath, JSON.stringify({ createdAt: new Date().toISOString(), cwd: dir, id: 'complete-without-newline', model: 'm', protocol: 'chat', provider: 'p', type: 'session' }))
+    expect((await openSessionStore(noFinalNewlinePath, dir)).id).toBe('complete-without-newline')
   })
 
   it('rejects malformed session JSONL lines', async () => {

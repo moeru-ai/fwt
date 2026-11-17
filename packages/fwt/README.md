@@ -87,7 +87,7 @@ The exit code tells you why the run stopped:
 | Exit code | `stopReason` | Meaning |
 | --- | --- | --- |
 | 0 | `completed` | The model gave its final answer. |
-| 3 | `context_limit` | The conversation filled the context window. |
+| 3 | `context_limit` | fwt could not compact the context enough to continue. Read `stopReasonDetail` in JSON Lines output or standard error for the reason. |
 | 4 | `loop_detected` | The model made the same tool calls three times in a row. |
 | 5 | `max_turns` | The run reached the limit that you set with `--max-turns`. |
 | 130 | `aborted` | The run was stopped, for example with Ctrl+C. |
@@ -102,7 +102,7 @@ fwt --resume 0f9c2a1e-5b7d-4c3a-9e21-6d8f4a0b1c2d -p "Also add a test for empty 
 
 The `sessionId` field of the `result` line gives the ID. `--resume latest` continues the most recent session in the resolved working directory. You can also give the path of the session file.
 
-A resumed session uses the provider and the model that it used before. If you give `--provider`, `--base-url`, or `--model`, fwt uses the new value.
+A resumed session uses the provider and the model that it used before. If you give `--provider`, `--base-url`, or `--model`, fwt uses the new value. fwt rebuilds its active context from the original message log and the latest compaction record. It does not send messages covered by that summary or call the model to rebuild it.
 
 Use `--fork` to continue from the same history in a new session file:
 
@@ -110,7 +110,7 @@ Use `--fork` to continue from the same history in a new session file:
 fwt --fork 0f9c2a1e-5b7d-4c3a-9e21-6d8f4a0b1c2d -p "Implement the first approach"
 ```
 
-`--fork` accepts a session ID, a session file path, or `latest`. It copies the source session's messages, including its initial user message and saved environment context, then adds your new prompt. It does not rebuild that context. The source file stays unchanged, and the new session has its own ID and usage statistics. Without `--cwd`, the fork uses the source session's working directory. Give `--cwd <path>` to run it in another worktree. The copied messages still name the source directory, so fwt adds the new working directory to your prompt and tells the model not to change files in the source directory. A fork uses the source provider and model unless you override them with `--provider`, `--base-url`, or `--model`. You cannot use `--fork` and `--resume` together.
+`--fork` accepts a session ID, a session file path, or `latest`. It copies the source session's messages and compaction records in order, including its initial user message and saved environment context. It then adds your new prompt. The source file stays unchanged, and the new session has its own ID and usage statistics. Without `--cwd`, the fork uses the source session's working directory. Give `--cwd <path>` to run it in another worktree. The copied messages still name the source directory, so fwt adds the new working directory to your prompt and tells the model not to change files in the source directory. A fork uses the source provider and model unless you override them with `--provider`, `--base-url`, or `--model`. You cannot use `--fork` and `--resume` together.
 
 The copied request message prefix stays byte-identical. Headers that contain `{session}`, including OpenCode's `x-opencode-session`, use the fork's new ID. A provider that scopes its cache by that header may not share cache entries across forks.
 
@@ -273,7 +273,11 @@ fwt takes the context window from `--context-length`, from `FWT_CONTEXT_LENGTH`,
 
 The output limit for one step is the lowest of three values: the `max_output` of the model, 32,768 tokens, and a quarter of the context window. fwt sends the output limit to the API only with the `messages` protocol, because the Anthropic Messages API requires it.
 
-fwt keeps the output limit free in the context window. When the input of a step reaches the rest of the window, the run stops with exit code 3.
+For a context window of `W` tokens and output limit `O`, fwt reserves `M = max(2048, ceil(0.02 × W))` tokens and sets the input budget to `B = W - O - M`. It compacts when estimated input reaches `floor(0.80 × B)`. After compaction, estimated input must fit within `floor(0.40 × B)`. The summary asks for a target of `min(4096, floor(0.05 × B))` tokens; the recent suffix targets `min(16384, floor(0.15 × B))` tokens. The suffix keeps complete interactions, and fwt retains every real user message before its cut. If required user text and the latest complete interaction do not fit after compaction, the run stops with exit code 3 and reports `stopReasonDetail` in JSON Lines output or standard error.
+
+Session files keep the original messages and record each adopted summary. Resume rebuilds the active context without another summary request.
+
+Compaction uses the main model once without running tools. It keeps the same system prompt, tools, effort, endpoint, and session ID. A valid summary replaces the previous summary in later model requests. Compaction does not reset tool execution sessions, turn limits, or repeated-call detection. ACP session load and resume replay the active context, including its summary and recent suffix, instead of replaying messages already covered by the summary.
 
 ### Retries
 

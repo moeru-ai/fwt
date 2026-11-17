@@ -67,6 +67,12 @@ const STOP_REASON_EXIT_CODES: Record<AgentStopReason, number> = {
   max_turns: 5,
 }
 
+const writeContextLimitDetail = (io: CliIo, reason: AgentStopReason, detail: string | undefined): void => {
+  if (reason !== 'context_limit' || detail == null)
+    return
+  io.stderr.write(`[context_limit] ${detail}\n`)
+}
+
 const providerAddFlags = defineFlags([
   { description: 'Base URL; sets the provider up manually instead of from models.dev', flag: '--base-url <url>' },
   { description: 'Wire protocol of --base-url', flag: '--protocol <chat|responses|messages>' },
@@ -266,14 +272,15 @@ export const createFwtCli = (options: CreateFwtCliOptions = {}): Cli => {
       })
 
       if (outputFormat === 'jsonl') {
-        const { cacheStats, steps, stopReason, text: finalText } = result
-        io.stdout.write(`${JSON.stringify({ cacheStats, sessionId: sessionStore.id, steps, stopReason, text: finalText, type: 'result' })}\n`)
+        const { cacheStats, steps, stopReason, stopReasonDetail, text: finalText } = result
+        io.stdout.write(`${JSON.stringify({ cacheStats, sessionId: sessionStore.id, steps, stopReason, stopReasonDetail, text: finalText, type: 'result' })}\n`)
       }
       else {
         if (!streamedText)
           io.stdout.write(result.text)
         if ((streamedText || result.text !== '') && !result.text.endsWith('\n'))
           io.stdout.write('\n')
+        writeContextLimitDetail(io, result.stopReason, result.stopReasonDetail)
       }
       return STOP_REASON_EXIT_CODES[result.stopReason]
     },
