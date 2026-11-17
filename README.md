@@ -84,6 +84,26 @@ This `srt.json` lets commands write only in one project directory and blocks the
 
 Use absolute paths in `srt.json`. srt resolves a relative path from the directory where the command starts, which can be a subdirectory.
 
+## Use MCP servers
+
+fwt has no MCP client. The model can use MCP servers through [`mcpdo`](https://modelcontextprotocol.io/docs/2026-07-28/tools/inspector/mcpdo), a command that keeps named connections open in a background process. Install it and connect your servers before you start fwt:
+
+```sh
+npm install -g @modelcontextprotocol/inspector
+mcpdo connect @docs https://example.com/mcp
+mcpdo connect @fs -- npx -y @modelcontextprotocol/server-filesystem /home/me/project
+```
+
+Then install the `mcpdo` skill, so fwt lists it and the model reads it when a task needs a server:
+
+```sh
+npx skills add modelcontextprotocol/inspector --skill mcpdo
+```
+
+The model then runs commands such as `mcpdo @docs tools/list --format json`. Because commands from fwt have no terminal, every command must name its connection with `@name`. When a server needs a sign-in or asks a question, `mcpdo` returns a URL or a question ID, and the model gives it to you in its answer.
+
+The MCP servers run in the `mcpdo` background process, outside a `shell` sandbox. On Linux, `srt` blocks the socket that `mcpdo` uses. To allow it, set `"allowAllUnixSockets": true` under `network` in `srt.json`. This setting allows every Unix socket, for example the Docker socket, so use it only when you trust that access.
+
 ## Documentation
 
 [The `fwt` command](packages/fwt/README.md) tells you how to add providers and run tasks. It also lists the flags, the environment variables, and the files.
