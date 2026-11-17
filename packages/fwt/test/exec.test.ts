@@ -78,6 +78,16 @@ describe('createExecManager', () => {
     expect(result.text).toContain('Process exited with code 7')
   })
 
+  it('uses non-interactive environment values for commands', async () => {
+    const manager = makeManager()
+    const result = await manager.execCommand({
+      cmd: 'printf "%s\\n" "$NO_COLOR" "$TERM" "$COLORTERM" "$PAGER" "$GIT_PAGER" "$GH_PAGER"',
+    })
+
+    expect(result.exitCode).toBe(0)
+    expect(result.output).toBe('1\ndumb\n\ncat\ncat\ncat\n')
+  })
+
   it('writes stdin and closes EOF immediately when stdin is provided', async () => {
     const manager = makeManager()
     const result = await manager.execCommand({

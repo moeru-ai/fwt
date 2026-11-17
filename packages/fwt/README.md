@@ -273,6 +273,8 @@ The model has these tools:
 
 `exec_command` returns after the command ends, or after `yield_time_ms` (default 10 seconds). If the command is still running, it keeps running, and the model can use `write_stdin` with the session ID. Commands do not get a terminal (TTY). Up to 64 commands can run at the same time. When the run ends or stops, fwt stops all of its commands.
 
+Commands inherit the fwt process environment, with these values set for each command: `NO_COLOR=1`, `TERM=dumb`, `COLORTERM` empty, and `PAGER`, `GIT_PAGER`, and `GH_PAGER` set to `cat`. These settings disable color and prevent pager programs from waiting for input. fwt does not change the command's locale.
+
 fwt has no tool that edits files. The model edits files with shell commands, for example a Python script on `stdin`.
 
 ### Project instructions

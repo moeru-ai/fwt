@@ -345,7 +345,15 @@ export const createExecManager = (options: ExecManagerOptions = {}): ExecManager
     const child = spawn(shell, ['-c', input.cmd], {
       cwd,
       detached: true,
-      env: process.env,
+      env: {
+        ...process.env,
+        COLORTERM: '',
+        GH_PAGER: 'cat',
+        GIT_PAGER: 'cat',
+        NO_COLOR: '1',
+        PAGER: 'cat',
+        TERM: 'dumb',
+      },
       stdio: ['pipe', 'pipe', 'pipe'],
     })
 
