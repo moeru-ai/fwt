@@ -12,6 +12,7 @@ words:
   - apos
   - behaviour
   - bumpp
+  - COLORTERM
   - commandcode
   - deepseek
   - devstral
@@ -41,6 +42,7 @@ words:
   - vercel
   - vitest
   - wayfinder
+  - worktrees
   - Wayfinding
   - xsai
   - xsmcp
