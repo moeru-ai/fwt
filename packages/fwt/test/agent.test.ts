@@ -647,7 +647,7 @@ describe('runAgent multi-protocol integration', () => {
     const server = await startServer((body, idx, res) => {
       const messages = body.messages as { content?: string, role: string }[]
       const isSummary = JSON.stringify(messages).includes('Write a continuation summary')
-      const text = idx === 0 ? 'x'.repeat(102_000) : idx === 2 ? 'y'.repeat(102_000) : isSummary ? summary : `answer-${idx}`
+      const text = idx === 0 ? 'x'.repeat(78_000) : idx === 2 ? 'y'.repeat(78_000) : isSummary ? summary : `answer-${idx}`
       writeSse(res, [
         { choices: [{ delta: { content: text, role: 'assistant' }, finish_reason: null, index: 0 }] },
         {
@@ -854,6 +854,65 @@ describe('runAgent multi-protocol integration', () => {
     expect(compactedRequest).toContain('The matching tool result stays with the call.')
   })
 
+  it.each(['chat', 'messages'] as const)('judges whether the summary request fits from the reported usage, not the byte estimate (%s)', async (protocol) => {
+    const dir = await makeTempDir()
+    const summary = [
+      'Goal and unfinished requirements',
+      'User corrections and active constraints',
+      'Current state and changed files',
+      'Decisions and rejected approaches',
+      'Checks run, results, and remaining verification',
+      'Running commands and exact identifiers',
+      'Next action and open questions',
+      'References to recover omitted details',
+    ].join('\n')
+    const server = await startServer((body, _idx, res) => {
+      const text = JSON.stringify(body.messages).includes('Write a continuation summary') ? summary : 'done'
+      if (protocol === 'messages') {
+        writeSse(res, [
+          { message: { id: 'msg', usage: { input_tokens: 32000, output_tokens: 1 } }, type: 'message_start' },
+          { content_block: { text: '', type: 'text' }, index: 0, type: 'content_block_start' },
+          { delta: { text, type: 'text_delta' }, index: 0, type: 'content_block_delta' },
+          { index: 0, type: 'content_block_stop' },
+          { delta: { stop_reason: 'end_turn' }, type: 'message_delta', usage: { output_tokens: 10 } },
+          { type: 'message_stop' },
+        ])
+        return
+      }
+      writeSse(res, [
+        { choices: [{ delta: { content: text, role: 'assistant' }, finish_reason: null, index: 0 }] },
+        { choices: [{ delta: {}, finish_reason: 'stop', index: 0 }], usage: { completion_tokens: 10, prompt_tokens: 32000, total_tokens: 32010 } },
+      ], ['data: [DONE]\n\n'])
+    })
+    await writeFile(join(dir, 'config.toml'), [
+      '[providers.local]',
+      `base_url = { ${protocol} = "${server.baseURL}" }`,
+      '[providers.local.models.compact-model]',
+      'context = 40000',
+      'image = false',
+      'max_output = 100',
+    ].join('\n'))
+    const model = resolveModel({ apiKey: 'test-key', home: dir, model: 'compact-model', provider: 'local' })
+    const store = await createSessionStore({ cwd: dir, id: 'usage-fit', model: 'compact-model', protocol, provider: 'local', sessionsDir: dir })
+    await store.appendMessage({ content: 'start', role: 'user' })
+    await store.appendMessage({ content: 'z'.repeat(111_000), role: 'assistant' })
+    await store.appendMessage({ content: 'more', role: 'user' })
+    await store.appendMessage({ content: 'ok', role: 'assistant' })
+    await store.appendUsage({ model: 'compact-model', stepNumber: 0, usage: { inputTokens: 31_500, outputTokens: 1, totalTokens: 31_501 } })
+
+    const result = await runAgent({ cwd: dir, model, prompt: 'continue', sessionStore: store, skills: [] })
+
+    expect(result.stopReason).toBe('completed')
+    expect(server.requests).toHaveLength(2)
+    expect(JSON.stringify(server.requests[0])).toContain('Write a continuation summary')
+    expect(JSON.stringify(server.requests[1])).not.toContain('z'.repeat(256))
+    if (protocol === 'messages') {
+      const [combined] = server.requests[1].messages as { content: { cache_control?: unknown, text?: string }[] }[]
+      expect(combined.content.at(-1)).toMatchObject({ cache_control: { type: 'ephemeral' } })
+      expect(combined.content.at(-1)?.text).toContain('Historical work state summary')
+    }
+  })
+
   it('keeps exec sessions, step counts, and loop detection across compaction', async () => {
     const dir = await makeTempDir()
     let execSessionId: string | undefined
@@ -909,6 +968,8 @@ describe('runAgent multi-protocol integration', () => {
     expect(result.steps).toBe(4)
     expect(server.requests).toHaveLength(5)
     expect(JSON.stringify(server.requests[3])).not.toContain('Unknown process session ID')
+    expect(JSON.stringify(server.requests[1])).toContain('old work old work')
+    expect(JSON.stringify(server.requests[2])).not.toContain('old work old work')
     expect(store.records().filter(record => record.type === 'compaction')).toHaveLength(1)
   })
 })

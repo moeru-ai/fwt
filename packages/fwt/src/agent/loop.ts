@@ -369,8 +369,8 @@ const selectTailStartMessage = (messages: readonly Message[], inputBudget: numbe
 
 const makeSummaryInstruction = (tailStartMessage: number, inputBudget: number, sessionFilePath: string | undefined): string => `Write a continuation summary for the conversation through raw message ${tailStartMessage}. The recent suffix starting at raw message ${tailStartMessage} will remain verbatim in the next context. Aim for no more than ${Math.min(4096, Math.floor(0.05 * inputBudget))} tokens. Treat any previous summary as prior state, and update it with new evidence. Do not claim an action succeeded without a result. Do not answer the user's task. Return only the summary. Use these eight sections exactly, and write "None" when a section has no entries:\n\n${COMPACTION_SECTIONS.join('\n')}\n\nThe summary is historical work state. The user's latest message remains the current request. ${sessionFilePath == null ? 'No session file exists, so omitted details cannot be recovered from the log; say when information is unavailable.' : `The original raw history remains in ${sessionFilePath}; use exec_command to recover omitted details when needed.`}`
 
-const summaryRequestFailure = (messages: readonly Message[], instruction: string, tools: unknown, contextTokens: number, outputTokens: number, margin: number): string | undefined => {
-  const estimate = estimateMessages([...messages, { content: instruction, role: 'user' }], tools) + outputTokens + margin
+const summaryRequestFailure = (currentInputTokens: number, instruction: string, contextTokens: number, outputTokens: number, margin: number): string | undefined => {
+  const estimate = currentInputTokens + estimateMessage({ content: instruction, role: 'user' }) + outputTokens + margin
   return estimate > contextTokens ? `The summary request needs about ${estimate} tokens, beyond the ${contextTokens}-token context window.` : undefined
 }
 
@@ -468,6 +468,7 @@ const compactionCandidate = (
 const generateCompaction = async (options: {
   activeCompaction: undefined | { summary: string, tailStartMessage: number }
   contextTokens: number
+  currentInputTokens: number
   inputBudget: number
   margin: number
   messages: Message[]
@@ -488,7 +489,7 @@ const generateCompaction = async (options: {
     const instruction = attempt === 0
       ? summaryInstruction
       : `${summaryInstruction}\n\nCorrection: the previous summary failed because ${failureReason}. Return a corrected summary with every required section.`
-    const requestFailure = summaryRequestFailure(options.messages, instruction, options.tools, options.contextTokens, options.outputTokens, options.margin)
+    const requestFailure = summaryRequestFailure(options.currentInputTokens, instruction, options.contextTokens, options.outputTokens, options.margin)
     if (requestFailure != null)
       return { reason: requestFailure }
     const generated = await requestSummary({
@@ -545,6 +546,7 @@ const compactConversation = async (options: {
   const generated = await generateCompaction({
     activeCompaction: options.activeCompaction,
     contextTokens,
+    currentInputTokens: currentEstimate,
     inputBudget,
     margin,
     messages: currentMessages,
@@ -576,7 +578,7 @@ const compactConversation = async (options: {
 }
 
 const prepareAgentStep = async (options: {
-  activeCompaction: undefined | { summary: string, tailStartMessage: number }
+  activeCompaction: () => undefined | { summary: string, tailStartMessage: number }
   compact: () => Promise<string | undefined>
   conversation: Message[]
   flushToolResults: () => Promise<void>
@@ -590,14 +592,15 @@ const prepareAgentStep = async (options: {
     options.onContextLimit(reason)
     throw new Error(`context_limit: ${reason}`)
   }
-  const activeMessages = buildActiveMessages(options.conversation, options.activeCompaction)
+  const activeCompaction = options.activeCompaction()
+  const activeMessages = buildActiveMessages(options.conversation, activeCompaction)
   options.setRequestMessageCount(options.conversation.length)
   if (options.protocol === 'chat')
     return { input: splitChatToolResultImages(activeMessages) }
   if (options.protocol === 'messages') {
     let input = applyMessagesCacheBreakpoints(activeMessages)
-    if (options.activeCompaction != null)
-      input = applyCompactionCacheBreakpoint(input, 0)
+    if (activeCompaction != null)
+      input = applyCompactionCacheBreakpoint(input, 1)
     return { input, instructions: undefined }
   }
   return { input: activeMessages }
@@ -741,7 +744,7 @@ export const runAgent = async (options: RunAgentOptions): Promise<AgentRunResult
     instructions: STATIC_SYSTEM_PROMPT,
     maxOutputTokens: options.model.protocol === 'messages' ? options.model.maxOutputTokens : undefined,
     prepareStep: async () => prepareAgentStep({
-      activeCompaction,
+      activeCompaction: () => activeCompaction,
       compact,
       conversation,
       flushToolResults,
