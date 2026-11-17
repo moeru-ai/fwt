@@ -69,3 +69,14 @@ fwt --resume <sessionId> -p "<follow-up>" --cwd <directory> -o jsonl
 ```
 
 The agent keeps everything from the earlier run. Write only what is new.
+
+## Fork a session
+
+Use `--resume` when one run should keep working in the same conversation. Use `--fork` when several follow-up runs should start from the same conversation and remain independent:
+
+```sh
+fwt --fork <sessionId> -p "Implement one approach" --cwd <worktree-a> -o jsonl
+fwt --fork <sessionId> -p "Implement another approach" --cwd <worktree-b> -o jsonl
+```
+
+Give each parallel run its own git worktree. A fork creates a new session ID and copies the source messages, including the initial user message and its saved environment context. It does not rebuild that context. The fork uses the source working directory unless you give `--cwd`; with `--cwd`, tools run in that worktree, but the copied instructions still describe the source session. The source provider and model carry over unless you override them. `latest` selects a session from the resolved working directory. `--fork` and `--resume` cannot be used together.

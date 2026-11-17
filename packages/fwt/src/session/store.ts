@@ -2,9 +2,11 @@ import type { Message, Usage } from '@xsai/text'
 
 import type { WireProtocol } from '../providers'
 
+import process from 'node:process'
+
 import { randomUUID } from 'node:crypto'
 import { existsSync } from 'node:fs'
-import { appendFile, mkdir, open, readdir, readFile, stat } from 'node:fs/promises'
+import { appendFile, mkdir, open, readdir, readFile } from 'node:fs/promises'
 import { dirname, join, resolve } from 'node:path'
 
 import * as v from 'valibot'
@@ -247,7 +249,23 @@ export const createSessionStore = async (options: CreateSessionStoreOptions): Pr
   return buildSessionStore(header, filePath, [], createCacheStats())
 }
 
-export const listSessionHeaders = async (sessionsDir: string): Promise<{ header: SessionHeader, updatedAt: Date }[]> => {
+export const forkSessionStore = async (
+  source: SessionStore,
+  options: { cwd?: string, model?: string, protocol?: WireProtocol, provider?: string, sessionsDir: string },
+): Promise<SessionStore> => {
+  const fork = await createSessionStore({
+    cwd: options.cwd ?? source.header.cwd,
+    model: options.model ?? source.header.model,
+    protocol: options.protocol ?? source.header.protocol,
+    provider: options.provider ?? source.header.provider,
+    sessionsDir: options.sessionsDir,
+  })
+  for (const message of source.messages())
+    await fork.appendMessage(message)
+  return fork
+}
+
+export const listSessionHeaders = async (sessionsDir: string): Promise<{ filePath: string, header: SessionHeader, updatedAt: Date }[]> => {
   if (!existsSync(sessionsDir))
     return []
   const names = (await readdir(sessionsDir)).filter(name => name.endsWith('.jsonl'))
@@ -256,7 +274,7 @@ export const listSessionHeaders = async (sessionsDir: string): Promise<{ header:
     try {
       const first = await handle.readLines()[Symbol.asyncIterator]().next()
       const parsed = v.safeParse(sessionHeaderSchema, safeParseJson(first.value ?? ''))
-      return parsed.success ? { header: parsed.output, updatedAt: (await handle.stat()).mtime } : undefined
+      return parsed.success ? { filePath: join(sessionsDir, name), header: parsed.output, updatedAt: (await handle.stat()).mtime } : undefined
     }
     finally {
       await handle.close()
@@ -267,12 +285,20 @@ export const listSessionHeaders = async (sessionsDir: string): Promise<{ header:
     .sort((a, b) => b.updatedAt.getTime() - a.updatedAt.getTime())
 }
 
-const findSessionFile = async (idOrPath: string, sessionsDir: string): Promise<string> => {
+const findSessionFile = async (idOrPath: string, sessionsDir: string, latestCwd: string): Promise<string> => {
   if (idOrPath.includes('/') || idOrPath.includes('\\') || idOrPath.endsWith('.jsonl')) {
     const resolved = resolve(idOrPath)
     if (!existsSync(resolved))
       throw new Error(`Session file not found: ${resolved}`)
     return resolved
+  }
+
+  if (idOrPath === 'latest') {
+    const cwdSessions = (await listSessionHeaders(sessionsDir))
+      .filter(entry => entry.header.cwd === latestCwd)
+    if (cwdSessions.length === 0)
+      throw new Error(`No session found for working directory "${latestCwd}".`)
+    return cwdSessions[0].filePath
   }
 
   if (!existsSync(sessionsDir))
@@ -281,16 +307,6 @@ const findSessionFile = async (idOrPath: string, sessionsDir: string): Promise<s
   const entries = (await readdir(sessionsDir)).filter(name => name.endsWith('.jsonl'))
   if (entries.length === 0)
     throw new Error(`No session files found in ${sessionsDir}`)
-
-  if (idOrPath === 'latest') {
-    const withMtime = await Promise.all(entries.map(async (name) => {
-      const full = join(sessionsDir, name)
-      const info = await stat(full)
-      return { full, mtimeMs: info.mtimeMs }
-    }))
-    withMtime.sort((a, b) => b.mtimeMs - a.mtimeMs)
-    return withMtime[0].full
-  }
 
   const exact = entries.find(name => name === `${idOrPath}.jsonl` || name.endsWith(`_${idOrPath}.jsonl`))
   if (exact != null)
@@ -305,8 +321,8 @@ const findSessionFile = async (idOrPath: string, sessionsDir: string): Promise<s
   throw new Error(`Session "${idOrPath}" not found in ${sessionsDir}`)
 }
 
-export const openSessionStore = async (idOrPath: string, sessionsDir: string): Promise<SessionStore> => {
-  const filePath = await findSessionFile(idOrPath, sessionsDir)
+export const openSessionStore = async (idOrPath: string, sessionsDir: string, latestCwd = process.cwd()): Promise<SessionStore> => {
+  const filePath = await findSessionFile(idOrPath, sessionsDir, latestCwd)
   const raw = await readFile(filePath, 'utf8')
   const lines = raw.split(/\r?\n/).filter(line => line.trim() !== '')
 

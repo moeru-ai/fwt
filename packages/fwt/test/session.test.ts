@@ -1,4 +1,4 @@
-import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, readFile, rm, utimes, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -7,6 +7,7 @@ import { afterEach, describe, expect, it } from 'vitest'
 import {
   createCacheStats,
   createSessionStore,
+  forkSessionStore,
   openSessionStore,
 } from '../src/session'
 
@@ -78,8 +79,63 @@ describe('sessionStore JSONL persistence', () => {
     expect(reopened.messages()).toEqual(store.messages())
     expect(reopened.cacheStats.snapshot().lastInputTokens).toBe(2000)
 
-    const latest = await openSessionStore('latest', dir)
+    const latest = await openSessionStore('latest', dir, dir)
     expect(latest.filePath).toBe(store.filePath)
+  })
+
+  it('scopes latest to the requested working directory', async () => {
+    const sessionsDir = await mkdtemp(join(tmpdir(), 'fwt-latest-'))
+    const cwdA = join(sessionsDir, 'worktree-a')
+    const cwdB = join(sessionsDir, 'worktree-b')
+    tempDirs.push(sessionsDir)
+
+    const olderA = await createSessionStore({ cwd: cwdA, id: 'older-a', model: 'm', protocol: 'chat', provider: 'p', sessionsDir })
+    const newestB = await createSessionStore({ cwd: cwdB, id: 'newest-b', model: 'm', protocol: 'chat', provider: 'p', sessionsDir })
+    const newestA = await createSessionStore({ cwd: cwdA, id: 'newest-a', model: 'm', protocol: 'chat', provider: 'p', sessionsDir })
+    await utimes(olderA.filePath, 1000, 1000)
+    await utimes(newestB.filePath, 2000, 2000)
+    await utimes(newestA.filePath, 3000, 3000)
+
+    expect((await openSessionStore('latest', sessionsDir, cwdA)).filePath).toBe(newestA.filePath)
+    expect((await openSessionStore('latest', sessionsDir, cwdB)).header.id).toBe('newest-b')
+    const missingCwd = join(sessionsDir, 'missing')
+    await expect(openSessionStore('latest', sessionsDir, missingCwd)).rejects.toThrow(`No session found for working directory "${missingCwd}".`)
+    expect(olderA.filePath).not.toBe(newestA.filePath)
+  })
+
+  it('forks messages into a new session without changing the source or copying usage', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'fwt-fork-'))
+    tempDirs.push(dir)
+    const source = await createSessionStore({
+      cwd: dir,
+      id: 'source-session',
+      model: 'deepseek-chat',
+      protocol: 'chat',
+      provider: 'deepseek',
+      sessionsDir: dir,
+    })
+    await source.appendMessage({ content: 'initial context', role: 'user' })
+    await source.appendMessage({ content: 'answer', role: 'assistant' })
+    await source.appendUsage({
+      model: 'deepseek-chat',
+      stepNumber: 0,
+      usage: { inputTokens: 2000, outputTokens: 100, totalTokens: 2100 },
+    })
+    const sourceBytes = await readFile(source.filePath, 'utf8')
+
+    const fork = await forkSessionStore(source, { cwd: join(dir, 'other-worktree'), sessionsDir: dir })
+
+    expect(fork.id).not.toBe(source.id)
+    expect(fork.header).toMatchObject({
+      cwd: join(dir, 'other-worktree'),
+      model: source.header.model,
+      protocol: source.header.protocol,
+      provider: source.header.provider,
+    })
+    expect(fork.messages()).toEqual(source.messages())
+    expect(fork.cacheStats.snapshot().steps).toBe(0)
+    expect(await readFile(source.filePath, 'utf8')).toBe(sourceBytes)
+    expect((await openSessionStore(fork.id, dir)).messages()).toEqual(source.messages())
   })
 
   it('rejects malformed session JSONL lines', async () => {

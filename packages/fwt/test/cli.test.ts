@@ -128,6 +128,42 @@ describe('fwt CLI', () => {
     expect(JSON.stringify(server.requests[1].messages)).toContain('first-answer')
   })
 
+  it('forks a session into a new worktree with the same request prefix', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'fwt-cli-fork-'))
+    cleanups.push(async () => rm(dir, { force: true, recursive: true }))
+    const otherCwd = join(dir, 'other-worktree')
+    const server = await createMockChatServer((_body, index, res) => {
+      writeChatSse(res, [
+        { choices: [{ delta: { content: `answer-${index}`, role: 'assistant' }, finish_reason: null, index: 0 }] },
+        { choices: [{ delta: {}, finish_reason: 'stop', index: 0 }] },
+      ])
+    })
+    cleanups.push(server.close)
+    const cli = createFwtCli({ home: dir })
+    const incompatibleIo = createMemoryIo({ cwd: dir })
+    expect(await cli.execute(['-p', 'prompt', '--resume', 'source', '--fork', 'source'], incompatibleIo)).not.toBe(0)
+    expect(incompatibleIo.stderr.text()).toContain('--resume and --fork cannot be used together.')
+    const run = async (args: string[]): Promise<{ sessionId: string }> => {
+      const io = createMemoryIo({ cwd: dir })
+      expect(await cli.execute(args, io)).toBe(0)
+      const result = io.stdout.text().trim().split('\n').map(line => JSON.parse(line) as { sessionId?: string, type: string }).find(line => line.type === 'result')
+      return { sessionId: result!.sessionId! }
+    }
+    const common = ['--base-url', server.baseURL, '--api-key', 'test-key', '--model', 'mock-model', '--header', 'x-session: {session}']
+
+    const source = await run(['-p', 'first prompt', ...common, '--output', 'jsonl'])
+    await run(['-p', 'source follow-up', '--resume', source.sessionId, ...common, '--output', 'jsonl'])
+    const fork = await run(['-p', 'fork follow-up', '--fork', source.sessionId, '--cwd', otherCwd, ...common, '--output', 'jsonl'])
+
+    const sourceLastRequest = server.requests[1].messages as unknown[]
+    const forkRequest = server.requests[2].messages as unknown[]
+    expect(JSON.stringify(forkRequest.slice(0, sourceLastRequest.length)))
+      .toBe(JSON.stringify(sourceLastRequest))
+    expect(fork.sessionId).not.toBe(source.sessionId)
+    expect(server.headers[0]['x-session']).toBe(source.sessionId)
+    expect(server.headers[2]['x-session']).toBe(fork.sessionId)
+  })
+
   it('spawns the compiled bin.js binary cleanly for --help, acp subcommand, and --acp handshakes', async () => {
     const binDist = resolve(import.meta.dirname, '..', 'dist', 'bin.js')
 

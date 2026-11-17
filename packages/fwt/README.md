@@ -92,9 +92,19 @@ fwt saves each run as a session. To give more instructions in the same conversat
 fwt --resume 0f9c2a1e-5b7d-4c3a-9e21-6d8f4a0b1c2d -p "Also add a test for empty input"
 ```
 
-The `sessionId` field of the `result` line gives the ID. `--resume latest` continues the most recent session. You can also give the path of the session file.
+The `sessionId` field of the `result` line gives the ID. `--resume latest` continues the most recent session in the resolved working directory. You can also give the path of the session file.
 
 A resumed session uses the provider and the model that it used before. If you give `--provider`, `--base-url`, or `--model`, fwt uses the new value.
+
+Use `--fork` to continue from the same history in a new session file:
+
+```sh
+fwt --fork 0f9c2a1e-5b7d-4c3a-9e21-6d8f4a0b1c2d -p "Implement the first approach"
+```
+
+`--fork` accepts a session ID, a session file path, or `latest`. It copies the source session's messages, including its initial user message and saved environment context, then adds your new prompt. It does not rebuild that context. The source file stays unchanged, and the new session has its own ID and usage statistics. Without `--cwd`, the fork uses the source session's working directory. Give `--cwd <path>` to run it in another worktree; the copied environment context still comes from the source session. A fork uses the source provider and model unless you override them with `--provider`, `--base-url`, or `--model`. You cannot use `--fork` and `--resume` together.
+
+The copied request message prefix stays byte-identical. Headers that contain `{session}`, including OpenCode's `x-opencode-session`, use the fork's new ID. A provider that scopes its cache by that header may not share cache entries across forks.
 
 ## Use a model without a provider
 
@@ -163,6 +173,7 @@ These flags apply only to `fwt`:
 | --- | --- |
 | `-p, --prompt <text>` | The prompt. |
 | `-r, --resume <session>` | A session ID, a session file path, or `latest`. |
+| `--fork <session>` | Start a new session from a session ID, file path, or `latest`. |
 | `-o, --output <text\|jsonl>` | The output format. The default is `text`. |
 | `--acp` | The same as `fwt acp`. |
 

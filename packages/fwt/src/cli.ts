@@ -2,6 +2,7 @@ import type { Cli, CliIo, CommandContext } from '@moeru/cliff'
 
 import type { AgentStopReason } from './agent'
 import type { ModelConfigInput, WireProtocol } from './providers'
+import type { SessionStore } from './session'
 
 import process from 'node:process'
 
@@ -17,7 +18,7 @@ import { startAcpServer } from './acp'
 import { runAgent } from './agent'
 import { fwtDirs } from './home'
 import { addProvider, listProviders, removeProvider, resolveModel, resolveRecordedModel } from './providers'
-import { createSessionStore, openSessionStore } from './session'
+import { createSessionStore, forkSessionStore, openSessionStore } from './session'
 
 interface CreateFwtCliOptions {
   fetch?: (request: Request) => Promise<Response>
@@ -101,6 +102,38 @@ const buildModelInput = (
 export const createFwtCli = (options: CreateFwtCliOptions = {}): Cli => {
   const sessionsDir = join(fwtDirs(options.home).state, 'sessions')
   const resolveCwd = (io: CliIo, cwd: string | undefined): string => resolve(io.cwd ?? process.cwd(), cwd ?? '')
+  const getRunSession = async (flags: Parameters<typeof buildModelInput>[0] & { cwd?: string, fork?: string, resume?: string }, io: CliIo) => {
+    const runCwd = resolveCwd(io, flags.cwd)
+    const sessionRef = flags.resume != null && flags.resume !== '' ? flags.resume : flags.fork
+    const source = sessionRef == null || sessionRef === '' ? undefined : await openSessionStore(sessionRef, sessionsDir, runCwd)
+    const modelInput = buildModelInput(flags, options)
+    const model = source == null ? resolveModel(modelInput) : resolveRecordedModel(modelInput, source.header)
+    let sessionStore: SessionStore
+
+    if (flags.fork != null && flags.fork !== '' && source != null) {
+      sessionStore = await forkSessionStore(source, {
+        cwd: flags.cwd == null ? undefined : runCwd,
+        model: model.model,
+        protocol: model.protocol,
+        provider: model.provider,
+        sessionsDir,
+      })
+    }
+    else if (source == null) {
+      sessionStore = await createSessionStore({
+        cwd: runCwd,
+        model: model.model,
+        protocol: model.protocol,
+        provider: model.provider,
+        sessionsDir,
+      })
+    }
+    else {
+      sessionStore = source
+    }
+
+    return { model, sessionStore }
+  }
   const runAcp = async ({ flags, io, signal }: CommandContext<typeof modelFlags>): Promise<void> => startAcpServer({
     input: io.stdin ?? process.stdin,
     maxTurns: flags.maxTurns,
@@ -170,6 +203,8 @@ export const createFwtCli = (options: CreateFwtCliOptions = {}): Cli => {
         return runAcp(context)
       if (flags.permissionMode === 'ask')
         throw new UsageError('--permission-mode ask needs an ACP client; use it with `fwt acp`.')
+      if (flags.resume != null && flags.resume !== '' && flags.fork != null && flags.fork !== '')
+        throw new UsageError('--resume and --fork cannot be used together.')
 
       let prompt = flags.prompt ?? args.prompt
       if ((prompt == null || prompt.trim() === '') && io.stdin != null && io.stdin.isTTY !== true)
@@ -178,16 +213,7 @@ export const createFwtCli = (options: CreateFwtCliOptions = {}): Cli => {
       if (prompt == null || prompt.trim() === '')
         throw new UsageError('Provide a prompt with -p/--prompt, positional text, or stdin.')
 
-      const modelInput = buildModelInput(flags, options)
-      const resumed = flags.resume != null && flags.resume !== '' ? await openSessionStore(flags.resume, sessionsDir) : undefined
-      const resolvedModel = resumed == null ? resolveModel(modelInput) : resolveRecordedModel(modelInput, resumed.header)
-      const sessionStore = resumed ?? await createSessionStore({
-        cwd: resolveCwd(io, flags.cwd),
-        model: resolvedModel.model,
-        protocol: resolvedModel.protocol,
-        provider: resolvedModel.provider,
-        sessionsDir,
-      })
+      const { model: resolvedModel, sessionStore } = await getRunSession(flags, io)
 
       const outputFormat = flags.output ?? 'text'
       let streamedText = false
@@ -238,6 +264,7 @@ export const createFwtCli = (options: CreateFwtCliOptions = {}): Cli => {
       ...modelFlags,
       { description: 'Prompt text to execute headlessly', flag: '-p, --prompt <text>' },
       { description: 'Resume an existing session by ID, path, or "latest"', flag: '-r, --resume <session>' },
+      { description: 'Fork an existing session by ID, path, or "latest"', flag: '--fork <session>' },
       { description: 'Output format', flag: '-o, --output <text|jsonl>' },
       { description: 'Run ACP stdio server (alias for `fwt acp`)', flag: '--acp' },
     ],
