@@ -27,10 +27,10 @@ Do not put an API key, a token, or a password in the prompt. fwt saves each prom
 
 ## Run the task
 
-Run fwt in the directory of the task, and ask for JSON Lines output:
+Run fwt in the directory of the task, and ask for JSON Lines output. Redirect standard input from `/dev/null`: fwt reads piped standard input until it ends and adds it to the prompt, so an open pipe makes it wait forever:
 
 ```sh
-fwt -p "<prompt>" --cwd <directory> -o jsonl
+fwt -p "<prompt>" --cwd <directory> -o jsonl < /dev/null
 ```
 
 If the prompt is long, write it to a file and send the file on standard input:
@@ -65,7 +65,7 @@ The final answer is what the model says. It is not proof that the work is done. 
 To give the same agent more instructions, use the session ID from the `result` line:
 
 ```sh
-fwt --resume <sessionId> -p "<follow-up>" --cwd <directory> -o jsonl
+fwt --resume <sessionId> -p "<follow-up>" --cwd <directory> -o jsonl < /dev/null
 ```
 
 The agent keeps everything from the earlier run. Write only what is new.
@@ -75,8 +75,8 @@ The agent keeps everything from the earlier run. Write only what is new.
 Use `--resume` when one run should keep working in the same conversation. Use `--fork` when several follow-up runs should start from the same conversation and remain independent:
 
 ```sh
-fwt --fork <sessionId> -p "Implement one approach" --cwd <worktree-a> -o jsonl
-fwt --fork <sessionId> -p "Implement another approach" --cwd <worktree-b> -o jsonl
+fwt --fork <sessionId> -p "Implement one approach" --cwd <worktree-a> -o jsonl < /dev/null
+fwt --fork <sessionId> -p "Implement another approach" --cwd <worktree-b> -o jsonl < /dev/null
 ```
 
 Give each parallel run its own git worktree. A fork creates a new session ID and copies the source messages, including the initial user message and its saved environment context. It does not rebuild that context. The fork uses the source working directory unless you give `--cwd`; with `--cwd`, tools run in that worktree, and fwt tells the agent that the earlier messages refer to the source directory. The source provider and model carry over unless you override them. `latest` selects a session from the resolved working directory. `--fork` and `--resume` cannot be used together.

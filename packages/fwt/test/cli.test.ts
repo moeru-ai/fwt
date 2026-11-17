@@ -5,10 +5,11 @@ import process from 'node:process'
 
 import { Buffer } from 'node:buffer'
 import { spawn } from 'node:child_process'
-import { mkdtemp, rm } from 'node:fs/promises'
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { createServer } from 'node:http'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
+import { PassThrough } from 'node:stream'
 
 import { createMemoryIo } from '@moeru/cliff/testing'
 import { afterEach, describe, expect, it } from 'vitest'
@@ -126,6 +127,84 @@ describe('fwt CLI', () => {
     expect(code2).toBe(0)
     expect(io2.stdout.text()).toBe('second-answer\n')
     expect(JSON.stringify(server.requests[1].messages)).toContain('first-answer')
+  })
+
+  it('adds piped stdin to a prompt', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'fwt-cli-stdin-'))
+    cleanups.push(async () => rm(dir, { force: true, recursive: true }))
+
+    const server = await createMockChatServer((_body, _idx, res) => {
+      writeChatSse(res, [
+        { choices: [{ delta: { content: 'reviewed', role: 'assistant' }, finish_reason: null, index: 0 }] },
+        { choices: [{ delta: {}, finish_reason: 'stop', index: 0 }] },
+      ])
+    })
+    cleanups.push(server.close)
+    const cli = createFwtCli({ home: dir })
+    const args = ['--base-url', server.baseURL, '--api-key', 'test-key', '--model', 'mock-model']
+    const pipedStdin = new PassThrough()
+    pipedStdin.end('diff --git a/file b/file\n+change')
+    expect(await cli.execute(['-p', 'Review this diff', ...args], createMemoryIo({ cwd: dir, stdin: pipedStdin }))).toBe(0)
+    const userMessage = (server.requests[0].messages as { content: string, role: string }[]).find(message => message.role === 'user')
+    expect(userMessage?.content).toContain('Review this diff\n\n<stdin>\ndiff --git a/file b/file\n+change\n</stdin>')
+
+    const emptyStdin = new PassThrough()
+    emptyStdin.end()
+    expect(await cli.execute(['-p', 'No input is expected', ...args], createMemoryIo({ cwd: dir, stdin: emptyStdin }))).toBe(0)
+    expect(JSON.stringify(server.requests[1].messages)).toContain('No input is expected')
+    expect(JSON.stringify(server.requests[1].messages)).not.toContain('<stdin>')
+  })
+
+  it('sends --image data to an image-capable model and rejects unsupported models', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'fwt-cli-image-'))
+    cleanups.push(async () => rm(dir, { force: true, recursive: true }))
+    const runDir = join(dir, 'workspace')
+    await mkdir(runDir)
+    const imagePath = join(runDir, 'screen.png')
+    const imageBytes = Buffer.from([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A])
+    await writeFile(imagePath, imageBytes)
+
+    const server = await createMockChatServer((_body, _idx, res) => {
+      writeChatSse(res, [
+        {
+          choices: [{
+            delta: { content: 'seen', role: 'assistant' },
+            finish_reason: null,
+            index: 0,
+          }],
+        },
+        {
+          choices: [{ delta: {}, finish_reason: 'stop', index: 0 }],
+        },
+      ])
+    })
+    cleanups.push(server.close)
+    const cli = createFwtCli({ home: dir })
+    expect(await cli.execute([
+      '-p',
+      'Describe this image',
+      '-i',
+      'screen.png',
+      '-i',
+      'screen.png',
+      '--cwd',
+      runDir,
+      '--base-url',
+      server.baseURL,
+      '--api-key',
+      'test-key',
+      '--model',
+      'mock-model',
+    ], createMemoryIo({ cwd: dir }))).toBe(0)
+    const imageRequest = JSON.stringify(server.requests[0].messages)
+    const imageData = `data:image/png;base64,${imageBytes.toString('base64')}`
+    expect(imageRequest.split(imageData)).toHaveLength(3)
+
+    await writeFile(join(dir, 'config.toml'), `[providers.local]\nmodel = "mock-model"\n[providers.local.base_url]\nchat = "${server.baseURL}"\n[providers.local.models.mock-model]\nimage = false\n`)
+    const rejectedIo = createMemoryIo({ cwd: dir })
+    expect(await cli.execute(['-p', 'Describe this image', '-i', imagePath, '--provider', 'local'], rejectedIo)).not.toBe(0)
+    expect(rejectedIo.stderr.text()).toContain('does not accept image input')
+    expect(server.requests).toHaveLength(1)
   })
 
   it('forks a session into a new worktree with the same request prefix', async () => {

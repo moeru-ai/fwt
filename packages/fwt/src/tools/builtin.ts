@@ -1,4 +1,4 @@
-import type { ExecutableTool, ToolResultPartContent } from '@xsai/text'
+import type { ExecutableTool, ImagePart, ToolResultPartContent } from '@xsai/text'
 
 import type { ExecManager } from './exec'
 
@@ -47,6 +47,21 @@ export const detectImageMimeType = (bytes: Uint8Array): string | undefined => {
     return 'image/webp'
   }
   return undefined
+}
+
+export const readImageFile = async (path: string, cwd: string, signal?: AbortSignal): Promise<ImagePart> => {
+  const resolvedPath = resolve(cwd, path)
+  const info = await stat(resolvedPath)
+  if (!info.isFile())
+    throw new Error(`Path is not a file: ${path}`)
+  if (info.size > MAX_IMAGE_BYTES)
+    throw new Error(`Image exceeds 20 MiB limit: ${path}`)
+
+  const bytes = await readFile(resolvedPath, { signal })
+  const mimeType = detectImageMimeType(bytes)
+  if (mimeType == null)
+    throw new Error(`Unsupported or unrecognized image format: ${path}`)
+  return { data: `data:${mimeType};base64,${encodeBase64(bytes)}`, type: 'image' }
 }
 
 const maxOutputTokensSchema = v.optional(v.pipe(v.number(), v.integer(), v.minValue(1), v.description('Maximum tokens of output to return (default 10000).')))
@@ -110,23 +125,8 @@ export const createTools = ({ cwd, execManager, supportsImageInput = true }: Cre
     description: 'Read a local PNG, JPEG, GIF, or WebP image file into the conversation context.',
     execute: async (input, options) => {
       options?.signal?.throwIfAborted()
-      const resolvedPath = resolve(cwd, input.path)
-      const info = await stat(resolvedPath)
-      if (!info.isFile())
-        throw new Error(`Path is not a file: ${input.path}`)
-      if (info.size > MAX_IMAGE_BYTES)
-        throw new Error(`Image exceeds 20 MiB limit: ${input.path}`)
-
-      const bytes = await readFile(resolvedPath, { signal: options?.signal })
-      const mimeType = detectImageMimeType(bytes)
-      if (mimeType == null)
-        throw new Error(`Unsupported or unrecognized image format: ${input.path}`)
-
-      return [{
-        data: `data:${mimeType};base64,${encodeBase64(bytes)}`,
-        ...(input.detail ? { detail: input.detail } : {}),
-        type: 'image',
-      }] satisfies ToolResultPartContent[]
+      const image = await readImageFile(input.path, cwd, options?.signal)
+      return [input.detail ? { ...image, detail: input.detail } : image] satisfies ToolResultPartContent[]
     },
     inputSchema: viewImageInputSchema,
     name: 'view_image',

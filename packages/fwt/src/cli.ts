@@ -19,6 +19,7 @@ import { runAgent } from './agent'
 import { fwtDirs } from './home'
 import { addProvider, listProviders, removeProvider, resolveModel, resolveRecordedModel } from './providers'
 import { createSessionStore, forkSessionStore, openSessionStore } from './session'
+import { readImageFile } from './tools'
 
 interface CreateFwtCliOptions {
   fetch?: (request: Request) => Promise<Response>
@@ -98,6 +99,26 @@ const buildModelInput = (
   protocol: flags.protocol,
   provider: flags.provider,
 })
+
+const readPrompt = async (prompt: string | undefined, io: CliIo): Promise<string> => {
+  const hasPrompt = prompt != null && prompt.trim() !== ''
+  if (io.stdin == null || io.stdin.isTTY === true) {
+    if (!hasPrompt)
+      throw new UsageError('Provide a prompt with -p/--prompt, positional text, or stdin.')
+    return prompt
+  }
+  if (hasPrompt)
+    io.stderr.write('Reading additional input from stdin...\n')
+  const stdinText = await text(io.stdin)
+  if (!hasPrompt) {
+    if (stdinText.trim() === '')
+      throw new UsageError('Provide a prompt with -p/--prompt, positional text, or stdin.')
+    return stdinText
+  }
+  if (stdinText === '')
+    return prompt
+  return `${prompt}\n\n<stdin>\n${stdinText}${stdinText.endsWith('\n') ? '' : '\n'}</stdin>`
+}
 
 export const createFwtCli = (options: CreateFwtCliOptions = {}): Cli => {
   const sessionsDir = join(fwtDirs(options.home).state, 'sessions')
@@ -206,15 +227,13 @@ export const createFwtCli = (options: CreateFwtCliOptions = {}): Cli => {
       if (flags.permissionMode === 'ask')
         throw new UsageError('--permission-mode ask needs an ACP client; use it with `fwt acp`.')
 
-      let prompt = flags.prompt ?? args.prompt
-      if ((prompt == null || prompt.trim() === '') && io.stdin != null && io.stdin.isTTY !== true)
-        prompt = await text(io.stdin)
-
-      if (prompt == null || prompt.trim() === '')
-        throw new UsageError('Provide a prompt with -p/--prompt, positional text, or stdin.')
+      let prompt = await readPrompt(flags.prompt ?? args.prompt, io)
 
       const { model: resolvedModel, previousCwd, sessionStore } = await getRunSession(flags, io)
       const cwd = sessionStore.header.cwd
+      if (flags.image.length > 0 && !resolvedModel.supportsImageInput)
+        throw new UsageError(`Model "${resolvedModel.model}" does not accept image input.`)
+      const images = await Promise.all(flags.image.map(async path => readImageFile(path, cwd)))
       if (previousCwd != null && previousCwd !== cwd)
         prompt = `<environment_context>\ncwd: ${cwd}\n</environment_context>\n\nThis session was forked from a session in ${previousCwd}. Earlier messages refer to files under ${previousCwd}; use the same relative paths under ${cwd}, and do not change files under ${previousCwd}.\n\n${prompt}`
 
@@ -224,6 +243,7 @@ export const createFwtCli = (options: CreateFwtCliOptions = {}): Cli => {
       const result = await runAgent({
         cwd,
         home: options.home,
+        images,
         maxTurns: flags.maxTurns,
         model: resolvedModel,
         onEvent: (event) => {
@@ -266,6 +286,11 @@ export const createFwtCli = (options: CreateFwtCliOptions = {}): Cli => {
     flags: [
       ...modelFlags,
       { description: 'Prompt text to execute headlessly', flag: '-p, --prompt <text>' },
+      {
+        description: 'Image to include in the prompt; repeatable',
+        flag: '-i, --image <path...>',
+        schema: v.optional(v.array(v.string()), []),
+      },
       { description: 'Resume an existing session by ID, path, or "latest"', flag: '-r, --resume <session>' },
       { description: 'Fork an existing session by ID, path, or "latest"', flag: '--fork <session>' },
       { description: 'Output format', flag: '-o, --output <text|jsonl>' },

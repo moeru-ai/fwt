@@ -64,6 +64,14 @@ You can also give the prompt as the first argument, or on standard input:
 git diff | fwt "Review this diff"
 ```
 
+When you give both a prompt and piped input, fwt adds the input to the prompt inside a `<stdin>` block. fwt reads the input until it ends, so a program that starts fwt with a pipe on standard input must close the pipe, or redirect standard input from `/dev/null`. You can attach an image with `-i` or `--image`; give the flag once for each image:
+
+```sh
+fwt -p "Describe these screenshots" -i before.png -i after.png
+```
+
+Image paths are relative to the run's working directory. Each image can be up to 20 MiB. Images must be PNG, JPEG, GIF, or WebP, and the model must accept image input.
+
 fwt works in the current directory. To use a different directory, add `--cwd <path>`.
 
 In the default text output, fwt writes the answer to standard output as the model writes it. To read each step from a program, add `-o jsonl`. fwt then writes one JSON object per line for each event. The last line has the type `result` and these fields:
@@ -172,6 +180,7 @@ These flags apply only to `fwt`:
 | Flag | Value |
 | --- | --- |
 | `-p, --prompt <text>` | The prompt. |
+| `-i, --image <path...>` | An image to include in the prompt. You can give it more than once. |
 | `-r, --resume <session>` | A session ID, a session file path, or `latest`. |
 | `--fork <session>` | Start a new session from a session ID, file path, or `latest`. |
 | `-o, --output <text\|jsonl>` | The output format. The default is `text`. |
