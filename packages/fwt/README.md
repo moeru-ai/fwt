@@ -279,7 +279,7 @@ fwt keeps the output limit free in the context window. When the input of a step 
 
 If a request to the model fails before the response starts, fwt sends it again up to four times. fwt does this for network errors, for status 429, and for status 500 and higher. It waits 200 ms before the first new attempt, and it doubles the wait each time. If the response has a `Retry-After` header, fwt waits that long, up to 60 seconds.
 
-If the response stops after it started, fwt does not send the request again. The run fails. You can continue it with `--resume`.
+If the response sends no bytes for 300 seconds, fwt stops that attempt. If a stream stops after it starts, fwt retries the model step up to five times, using the same waits. It does not retry other 4xx errors or a request you abort. The run saves only the successful assistant message. Text or reasoning deltas already sent to the caller can appear again after a retry.
 
 ### Tools
 

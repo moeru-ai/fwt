@@ -328,6 +328,80 @@ describe('providers', () => {
     expect(String(exhausted.error)).toContain('503')
   })
 
+  it('times out an idle response stream and retries the request', async () => {
+    const home = await makeHome()
+    vi.useFakeTimers()
+    let calls = 0
+    let requestStarted!: () => void
+    const firstRequest = new Promise<void>((resolve) => {
+      requestStarted = resolve
+    })
+    const resolved = resolveModel({
+      baseURL: 'https://retry.example/v1',
+      fetch: async () => {
+        calls += 1
+        if (calls === 1)
+          requestStarted()
+        if (calls === 1) {
+          return new Response(new ReadableStream<Uint8Array>({
+            start: () => undefined,
+          }), { headers: { 'content-type': 'text/event-stream' } })
+        }
+        return new Response([
+          `data: ${JSON.stringify({ choices: [{ delta: { content: 'recovered', role: 'assistant' }, finish_reason: null, index: 0 }] })}\n\n`,
+          `data: ${JSON.stringify({ choices: [{ delta: {}, finish_reason: 'stop', index: 0 }] })}\n\n`,
+          'data: [DONE]\n\n',
+        ].join(''), { headers: { 'content-type': 'text/event-stream' } })
+      },
+      home,
+      model: 'm',
+    })
+    const generated = generateText(resolved.languageModel('s'), {
+      input: [{ content: [{ text: 'hi', type: 'text' }], role: 'user' }],
+    })
+
+    try {
+      await firstRequest
+      await vi.advanceTimersByTimeAsync(300_500)
+      await expect(generated).resolves.toMatchObject({ text: 'recovered' })
+      expect(calls).toBe(2)
+    }
+    finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('does not retry an aborted stream', async () => {
+    const home = await makeHome()
+    const controller = new AbortController()
+    let calls = 0
+    let requestStarted!: () => void
+    const firstRequest = new Promise<void>((resolve) => {
+      requestStarted = resolve
+    })
+    const resolved = resolveModel({
+      baseURL: 'https://retry.example/v1',
+      fetch: async () => {
+        calls += 1
+        requestStarted()
+        return new Response(new ReadableStream<Uint8Array>({
+          start: () => undefined,
+        }), { headers: { 'content-type': 'text/event-stream' } })
+      },
+      home,
+      model: 'm',
+    })
+    const generated = generateText(resolved.languageModel('s'), {
+      input: [{ content: [{ text: 'hi', type: 'text' }], role: 'user' }],
+      signal: controller.signal,
+    })
+    await firstRequest
+    controller.abort()
+
+    await expect(generated).rejects.toThrow()
+    expect(calls).toBe(1)
+  })
+
   it('resumes with the recorded model unless a new provider, base URL or model is given', async () => {
     const home = await makeHome()
     await writeFile(join(home, 'config.toml'), [

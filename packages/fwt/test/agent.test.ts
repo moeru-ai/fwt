@@ -5,7 +5,7 @@ import type { AgentEvent } from '../src/agent'
 import type { WireProtocol } from '../src/providers'
 
 import { Buffer } from 'node:buffer'
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { createServer } from 'node:http'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -239,6 +239,52 @@ describe('runAgent multi-protocol integration', () => {
     await runProtocolToolLoop('chat')
     await runProtocolToolLoop('responses')
     await runProtocolToolLoop('messages')
+  })
+
+  it('retries a broken model stream without saving a duplicate assistant message', async () => {
+    const dir = await makeTempDir()
+    const server = await startServer(async (_body, idx, res) => {
+      if (idx === 0) {
+        res.writeHead(200, { 'content-type': 'text/event-stream' })
+        res.write(`data: ${JSON.stringify({ choices: [{ delta: { content: 'partial', role: 'assistant' }, finish_reason: null, index: 0 }] })}\n\n`)
+        await sleep(20)
+        res.destroy()
+        return
+      }
+      writeSse(res, [
+        { choices: [{ delta: { content: 'complete', role: 'assistant' }, finish_reason: null, index: 0 }] },
+        { choices: [{ delta: {}, finish_reason: 'stop', index: 0 }] },
+      ], ['data: [DONE]\n\n'])
+    })
+    const sessionStore = await createSessionStore({
+      cwd: dir,
+      id: 'stream-retry',
+      model: 'mock-model',
+      protocol: 'chat',
+      provider: 'custom',
+      sessionsDir: dir,
+    })
+    const model = resolveModel({ baseURL: server.baseURL, model: 'mock-model', protocol: 'chat' })
+    const events: AgentEvent[] = []
+
+    const result = await runAgent({
+      cwd: dir,
+      model,
+      onEvent: event => events.push(event),
+      prompt: 'say hello',
+      sessionStore,
+      skills: [],
+    })
+
+    const records = (await readFile(sessionStore.filePath, 'utf8'))
+      .trim()
+      .split('\n')
+      .map(line => JSON.parse(line) as { message?: { role?: string }, type: string })
+    expect(result.text).toBe('complete')
+    expect(server.requests).toHaveLength(2)
+    expect(events.filter(event => event.type === 'text.delta').map(event => event.delta)).toEqual(['partial', 'complete'])
+    expect(events.filter(event => event.type === 'step.start')).toHaveLength(1)
+    expect(records.filter(record => record.type === 'message' && record.message?.role === 'assistant')).toHaveLength(1)
   })
 
   it('splits parallel view_image tool results cleanly on chat while keeping canonical JSONL intact', async () => {
